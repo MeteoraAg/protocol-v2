@@ -16,11 +16,11 @@ mainnet-beta=[]
 default=["mainnet-beta"]
 
 [dependencies]
-anchor-lang = "0.25.0"
-solana-program = "1.10.29"
-anchor-spl = "0.25.0"
+anchor-lang = "0.24.2"
+solana-program = "1.9.29"
+anchor-spl = "0.24.2"
 pyth-client = "0.2.2"
-bytemuck = { version = "1.4.0", features = [ "extern_crate_alloc" ] }
+bytemuck = { version = "~1.7.0", features = [ "extern_crate_alloc" ] }
 borsh = "0.9.1"
 num-traits = "0.2"
 uint = { version = "0.9.1", default-features = false }
