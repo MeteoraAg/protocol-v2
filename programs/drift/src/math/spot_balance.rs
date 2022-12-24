@@ -122,6 +122,55 @@ pub fn calculate_spot_market_utilization(spot_market: &SpotMarket) -> DriftResul
     Ok(utilization)
 }
 
+pub fn calculate_deposit_rate(spot_market: &SpotMarket) -> DriftResult<u128> {
+    let utilization = calculate_spot_market_utilization(spot_market)?;
+    let borrow_rate = calculate_borrow_rate(spot_market)?;
+    let deposit_rate = borrow_rate
+        .safe_mul(utilization)?
+        .safe_div(SPOT_UTILIZATION_PRECISION)?;
+
+    Ok(deposit_rate)
+}
+
+pub fn calculate_borrow_rate(spot_market: &SpotMarket) -> DriftResult<u128> {
+    let utilization = calculate_spot_market_utilization(spot_market)?;
+
+    if utilization == 0 {
+        return Ok(0);
+    }
+
+    let borrow_rate = if utilization > spot_market.optimal_utilization.cast()? {
+        let surplus_utilization = utilization.safe_sub(spot_market.optimal_utilization.cast()?)?;
+
+        let borrow_rate_slope = spot_market
+            .max_borrow_rate
+            .cast::<u128>()?
+            .safe_sub(spot_market.optimal_borrow_rate.cast()?)?
+            .safe_mul(SPOT_UTILIZATION_PRECISION)?
+            .safe_div(
+                SPOT_UTILIZATION_PRECISION.safe_sub(spot_market.optimal_utilization.cast()?)?,
+            )?;
+
+        spot_market.optimal_borrow_rate.cast::<u128>()?.safe_add(
+            surplus_utilization
+                .safe_mul(borrow_rate_slope)?
+                .safe_div(SPOT_UTILIZATION_PRECISION)?,
+        )?
+    } else {
+        let borrow_rate_slope = spot_market
+            .optimal_borrow_rate
+            .cast::<u128>()?
+            .safe_mul(SPOT_UTILIZATION_PRECISION)?
+            .safe_div(spot_market.optimal_utilization.cast()?)?;
+
+        utilization
+            .safe_mul(borrow_rate_slope)?
+            .safe_div(SPOT_UTILIZATION_PRECISION)?
+    };
+
+    Ok(borrow_rate)
+}
+
 pub fn calculate_accumulated_interest(
     spot_market: &SpotMarket,
     now: i64,
