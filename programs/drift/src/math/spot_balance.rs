@@ -9,6 +9,8 @@ use crate::state::spot_market::{SpotBalanceType, SpotMarket};
 use crate::state::user::SpotPosition;
 use crate::validate;
 
+use super::constants::PERCENTAGE_PRECISION;
+
 pub fn get_spot_balance(
     token_amount: u128,
     spot_market: &SpotMarket,
@@ -126,8 +128,10 @@ pub fn calculate_deposit_rate(spot_market: &SpotMarket) -> DriftResult<u128> {
     let utilization = calculate_spot_market_utilization(spot_market)?;
     let borrow_rate = calculate_borrow_rate(spot_market)?;
     let deposit_rate = borrow_rate
+        .safe_mul(PERCENTAGE_PRECISION.safe_sub(spot_market.insurance_fund.total_factor.into())?)?
         .safe_mul(utilization)?
-        .safe_div(SPOT_UTILIZATION_PRECISION)?;
+        .safe_div(SPOT_UTILIZATION_PRECISION)?
+        .safe_div(PERCENTAGE_PRECISION)?;
 
     Ok(deposit_rate)
 }
