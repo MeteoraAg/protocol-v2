@@ -1,24 +1,14 @@
 {
-	"name": "@drift-labs/sdk",
-	"version": "2.8.0-beta.2",
-	"main": "lib/index.js",
-	"types": "lib/index.d.ts",
-	"author": "crispheaney",
-	"homepage": "https://www.drift.trade/",
-	"repository": {
-		"type": "git",
-		"url": "git@github.com:drift-labs/protocol-v2.git"
-	},
+	"name": "@mercurial-finance/drift-sdk",
+	"version": "1.0.3",
+	"main": "./dist/index.js",
+	"module": "./dist/index.mjs",
+	"types": "./dist/index.d.ts",
+	"files": [
+		"dist/**"
+	],
 	"scripts": {
-		"lint": "eslint './**/*.{ts,tsx}' --quiet",
-		"build": "yarn clean && tsc",
-		"clean": "rm -rf lib",
-		"test": "mocha -r ts-node/register tests/**/*.ts",
-		"test:inspect": "mocha --inspect-brk -r ts-node/register tests/**/*.ts",
-		"test:bignum": "mocha -r ts-node/register tests/bn/**/*.ts",
-		"patch-and-pub": "npm version patch --force && npm publish",
-		"prettify": "prettier --check './src/***/*.ts'",
-		"prettify:fix": "prettier --write './{src,tests}/***/*.ts'"
+		"build": "tsup"
 	},
 	"keywords": [
 		"drift-labs",
@@ -39,6 +29,7 @@
 		"@solana/spl-token": "^0.1.6",
 		"@solana/web3.js": "1.66.2",
 		"@switchboard-xyz/switchboard-v2": "^0.0.67",
+		"bs58": "^5.0.0",
 		"strict-event-emitter-types": "^2.0.0",
 		"uuid": "^8.3.2"
 	},
@@ -54,7 +45,9 @@
 		"eslint-plugin-prettier": "^3.4.0",
 		"mocha": "^10.0.0",
 		"prettier": "^2.4.1",
-		"ts-node": "^10.8.0"
+		"ts-node": "^10.8.0",
+		"tsup": "^6.5.0",
+		"typescript": "^4.9.4"
 	},
 	"description": "SDK for Drift Protocol",
 	"engines": {
