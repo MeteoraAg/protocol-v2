@@ -14,7 +14,7 @@ import {
 import { OracleInfo } from './oracles/types';
 import { Program, ProgramAccount } from '@coral-xyz/anchor';
 
-type DriftConfig = {
+export type DriftConfig = {
 	ENV: DriftEnv;
 	PYTH_ORACLE_MAPPING_ADDRESS: string;
 	DRIFT_PROGRAM_ID: string;
