@@ -318,27 +318,27 @@ pub fn update_position_and_market(
     }
 
     // Validate that user funding rate is up to date before modifying
-    match position.get_direction() {
-        PositionDirection::Long if position.base_asset_amount != 0 => {
-            validate!(
-                position.last_cumulative_funding_rate.cast::<i128>()? == market.amm.cumulative_funding_rate_long,
-                ErrorCode::InvalidPositionLastFundingRate,
-                "position.last_cumulative_funding_rate {} market.amm.cumulative_funding_rate_long {}",
-                position.last_cumulative_funding_rate.cast::<i128>()?,
-                market.amm.cumulative_funding_rate_long,
-            )?;
-        }
-        PositionDirection::Short => {
-            validate!(
-                position.last_cumulative_funding_rate == market.amm.cumulative_funding_rate_short.cast::<i64>()?,
-                ErrorCode::InvalidPositionLastFundingRate,
-                "position.last_cumulative_funding_rate {} market.amm.cumulative_funding_rate_short {}",
-                position.last_cumulative_funding_rate,
-                market.amm.cumulative_funding_rate_short,
-            )?;
-        }
-        _ => {}
-    }
+    // match position.get_direction() {
+    //     PositionDirection::Long if position.base_asset_amount != 0 => {
+    //         validate!(
+    //             position.last_cumulative_funding_rate == market.amm.cumulative_funding_rate_long.cast()?,
+    //             ErrorCode::InvalidPositionLastFundingRate,
+    //             "position.last_cumulative_funding_rate {} market.amm.cumulative_funding_rate_long {}",
+    //             position.last_cumulative_funding_rate,
+    //             market.amm.cumulative_funding_rate_long,
+    //         )?;
+    //     }
+    //     PositionDirection::Short => {
+    //         validate!(
+    //             position.last_cumulative_funding_rate == market.amm.cumulative_funding_rate_short.cast()?,
+    //             ErrorCode::InvalidPositionLastFundingRate,
+    //             "position.last_cumulative_funding_rate {} market.amm.cumulative_funding_rate_short {}",
+    //             position.last_cumulative_funding_rate,
+    //             market.amm.cumulative_funding_rate_short,
+    //         )?;
+    //     }
+    //     _ => {}
+    // }
 
     // Update user position
     if let PositionUpdateType::Close = update_type {
