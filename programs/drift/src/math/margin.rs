@@ -9,8 +9,8 @@ use crate::math::position::{
     calculate_base_asset_value_with_oracle_price,
 };
 
-use crate::validate;
 use crate::validation;
+use crate::{validate, PRICE_PRECISION_I128};
 
 use crate::math::casting::Cast;
 use crate::math::funding::calculate_funding_payment;
@@ -32,6 +32,7 @@ use crate::state::user::{PerpPosition, SpotPosition, User};
 use num_integer::Roots;
 use solana_program::msg;
 use std::cmp::{max, min, Ordering};
+use std::ops::Neg;
 
 #[cfg(test)]
 mod tests;
@@ -56,9 +57,8 @@ pub fn calculate_size_premium_liability_weight(
 
     let imf_factor_u128 = imf_factor.cast::<u128>()?;
     let liability_weight_u128 = liability_weight.cast::<u128>()?;
-    let liability_weight_numerator = liability_weight_u128.safe_sub(
-        liability_weight_u128.safe_div(max(1, SPOT_IMF_PRECISION_U128 / imf_factor_u128))?,
-    )?;
+    let liability_weight_numerator =
+        liability_weight_u128.safe_sub(liability_weight_u128.safe_div(5)?)?;
 
     // increases
     let size_premium_liability_weight = liability_weight_numerator
@@ -131,9 +131,12 @@ pub fn calculate_perp_position_value_and_pnl(
     market_position: &PerpPosition,
     market: &PerpMarket,
     oracle_price_data: &OraclePriceData,
+    quote_oracle_price: i64,
+    quote_oracle_twap: i64,
     margin_requirement_type: MarginRequirementType,
     user_custom_margin_ratio: u32,
     with_bounds: bool,
+    strict: bool,
 ) -> DriftResult<(u128, i128, u128)> {
     let unrealized_funding = calculate_funding_payment(
         if market_position.base_asset_amount > 0 {
@@ -204,6 +207,17 @@ pub fn calculate_perp_position_value_and_pnl(
         valuation_price,
     )?;
 
+    // for calculating the perps value, since it's a liability, use the large of twap and quote oracle price
+    let quote_price = if strict {
+        quote_oracle_price.max(quote_oracle_twap)
+    } else {
+        quote_oracle_price
+    };
+
+    let worse_case_base_asset_value = worse_case_base_asset_value
+        .safe_mul(quote_price.cast()?)?
+        .safe_div(PRICE_PRECISION)?;
+
     let margin_ratio = user_custom_margin_ratio.max(market.get_margin_ratio(
         worst_case_base_asset_amount.unsigned_abs(),
         margin_requirement_type,
@@ -224,9 +238,19 @@ pub fn calculate_perp_position_value_and_pnl(
     let unrealized_asset_weight =
         market.get_unrealized_asset_weight(total_unrealized_pnl, margin_requirement_type)?;
 
+    let quote_price = if strict && unrealized_pnl > 0 {
+        quote_oracle_price.min(quote_oracle_twap)
+    } else if strict && unrealized_pnl < 0 {
+        quote_oracle_price.max(quote_oracle_twap)
+    } else {
+        quote_oracle_price
+    };
+
     let mut weighted_unrealized_pnl = total_unrealized_pnl
-        .safe_mul(unrealized_asset_weight as i128)?
-        .safe_div(SPOT_WEIGHT_PRECISION as i128)?;
+        .safe_mul(quote_price.cast()?)?
+        .safe_div(PRICE_PRECISION_I128)?
+        .safe_mul(unrealized_asset_weight.cast()?)?
+        .safe_div(SPOT_WEIGHT_PRECISION.cast()?)?;
 
     if with_bounds && margin_requirement_type == MarginRequirementType::Initial {
         // safety guard for dangerously configured perp market
@@ -238,6 +262,33 @@ pub fn calculate_perp_position_value_and_pnl(
         weighted_unrealized_pnl,
         worse_case_base_asset_value,
     ))
+}
+
+pub fn calculate_user_safest_position_tiers(
+    user: &User,
+    perp_market_map: &PerpMarketMap,
+    spot_market_map: &SpotMarketMap,
+) -> DriftResult<(AssetTier, ContractTier)> {
+    let mut safest_tier_spot_liablity: AssetTier = AssetTier::default();
+    let mut safest_tier_perp_liablity: ContractTier = ContractTier::default();
+
+    for spot_position in user.spot_positions.iter() {
+        if spot_position.is_available() || spot_position.balance_type == SpotBalanceType::Deposit {
+            continue;
+        }
+        let spot_market = spot_market_map.get_ref(&spot_position.market_index)?;
+        safest_tier_spot_liablity = min(safest_tier_spot_liablity, spot_market.asset_tier);
+    }
+
+    for market_position in user.perp_positions.iter() {
+        if market_position.is_available() {
+            continue;
+        }
+        let market = &perp_market_map.get_ref(&market_position.market_index)?;
+        safest_tier_perp_liablity = min(safest_tier_perp_liablity, market.contract_tier);
+    }
+
+    Ok((safest_tier_spot_liablity, safest_tier_perp_liablity))
 }
 
 pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
@@ -266,7 +317,7 @@ pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
     for spot_position in user.spot_positions.iter() {
         validation::position::validate_spot_position(spot_position)?;
 
-        if spot_position.scaled_balance == 0 && spot_position.open_orders == 0 {
+        if spot_position.is_available() {
             continue;
         }
 
@@ -279,7 +330,7 @@ pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
             is_oracle_valid_for_action(oracle_validity, Some(DriftAction::MarginCalc))?;
 
         if spot_market.market_index == 0 {
-            let token_amount = spot_position.get_token_amount(&spot_market)?;
+            let token_amount = spot_position.get_signed_token_amount(&spot_market)?;
             if token_amount == 0 {
                 validate!(
                     spot_position.scaled_balance == 0,
@@ -289,18 +340,33 @@ pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
                     token_amount,
                 )?;
             }
+
+            let token_value = if strict {
+                get_strict_token_value(
+                    token_amount,
+                    spot_market.decimals,
+                    oracle_price_data,
+                    spot_market
+                        .historical_oracle_data
+                        .last_oracle_price_twap_5min,
+                )?
+            } else {
+                get_token_value(token_amount, spot_market.decimals, oracle_price_data.price)?
+            };
+
             match spot_position.balance_type {
                 SpotBalanceType::Deposit => {
-                    total_collateral = total_collateral.safe_add(token_amount.cast::<i128>()?)?
+                    total_collateral = total_collateral.safe_add(token_value)?
                 }
                 SpotBalanceType::Borrow => {
+                    let token_value = token_value.unsigned_abs();
                     let liability_weight = user_custom_margin_ratio.max(SPOT_WEIGHT_PRECISION);
-                    let weighted_token_value = token_amount
+                    let weighted_token_value = token_value
                         .safe_mul(liability_weight.cast()?)?
                         .safe_div(SPOT_WEIGHT_PRECISION_U128)?;
 
                     validate!(
-                        weighted_token_value >= token_amount,
+                        weighted_token_value >= token_value,
                         ErrorCode::InvalidMarginRatio,
                         "weighted_token_value={} < abs(token_amount={}) in spot market_index={}",
                         weighted_token_value,
@@ -317,14 +383,13 @@ pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
                     )?;
 
                     margin_requirement = margin_requirement.safe_add(weighted_token_value)?;
-
                     num_spot_liabilities += 1;
 
                     if let Some(margin_buffer_ratio) = margin_buffer_ratio {
                         margin_requirement_plus_buffer = margin_requirement_plus_buffer.safe_add(
                             calculate_margin_requirement_with_buffer(
                                 weighted_token_value,
-                                token_amount,
+                                token_value,
                                 margin_buffer_ratio,
                             )?,
                         )?;
@@ -332,11 +397,21 @@ pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
                 }
             }
         } else {
-            let (worst_case_token_amount, worst_cast_quote_token_amount): (i128, i128) =
-                spot_position.get_worst_case_token_amounts(
+            let signed_token_amount = spot_position.get_signed_token_amount(&spot_market)?;
+            let (worst_case_token_amount, worst_case_orders_value): (i128, i128) = spot_position
+                .get_worst_case_token_amount(
                     &spot_market,
                     oracle_price_data,
-                    None,
+                    if strict {
+                        Some(
+                            spot_market
+                                .historical_oracle_data
+                                .last_oracle_price_twap_5min,
+                        )
+                    } else {
+                        None
+                    },
+                    Some(signed_token_amount),
                 )?;
 
             if worst_case_token_amount == 0 {
@@ -349,9 +424,9 @@ pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
                 )?;
             }
 
-            let worst_case_token_value = if strict {
+            let signed_token_value = if strict {
                 get_strict_token_value(
-                    worst_case_token_amount,
+                    signed_token_amount,
                     spot_market.decimals,
                     oracle_price_data,
                     spot_market
@@ -360,11 +435,15 @@ pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
                 )?
             } else {
                 get_token_value(
-                    worst_case_token_amount,
+                    signed_token_amount,
                     spot_market.decimals,
                     oracle_price_data.price,
                 )?
             };
+
+            // the worst case token value is the deposit/borrow amount * oracle + worst case order size * oracle
+            let worst_case_token_value =
+                signed_token_value.safe_add(worst_case_orders_value.neg())?;
 
             margin_requirement =
                 margin_requirement.safe_add(spot_position.margin_requirement_for_open_orders()?)?;
@@ -435,14 +514,14 @@ pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
                 }
             }
 
-            match worst_cast_quote_token_amount.cmp(&0) {
+            match worst_case_orders_value.cmp(&0) {
                 Ordering::Greater => {
                     total_collateral =
-                        total_collateral.safe_add(worst_cast_quote_token_amount.cast::<i128>()?)?
+                        total_collateral.safe_add(worst_case_orders_value.cast::<i128>()?)?
                 }
                 Ordering::Less => {
                     let liability_weight = user_custom_margin_ratio.max(SPOT_WEIGHT_PRECISION);
-                    let weighted_token_value = worst_cast_quote_token_amount
+                    let weighted_token_value = worst_case_orders_value
                         .unsigned_abs()
                         .safe_mul(liability_weight.cast()?)?
                         .safe_div(SPOT_WEIGHT_PRECISION_U128)?;
@@ -453,7 +532,7 @@ pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
                         margin_requirement_plus_buffer = margin_requirement_plus_buffer.safe_add(
                             calculate_margin_requirement_with_buffer(
                                 weighted_token_value,
-                                worst_cast_quote_token_amount.unsigned_abs(),
+                                worst_case_orders_value.unsigned_abs(),
                                 margin_buffer_ratio,
                             )?,
                         )?;
@@ -465,15 +544,32 @@ pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
     }
 
     for market_position in user.perp_positions.iter() {
-        if market_position.base_asset_amount == 0
-            && market_position.quote_asset_amount == 0
-            && !market_position.has_open_order()
-            && !market_position.is_lp()
-        {
+        if market_position.is_available() {
             continue;
         }
 
         let market = &perp_market_map.get_ref(&market_position.market_index)?;
+
+        let (quote_oracle_price, quote_oracle_twap) = {
+            let quote_spot_market = spot_market_map.get_ref(&market.quote_spot_market_index)?;
+            let (quote_oracle_price_data, quote_oracle_validity) = oracle_map
+                .get_price_data_and_validity(
+                    &quote_spot_market.oracle,
+                    quote_spot_market
+                        .historical_oracle_data
+                        .last_oracle_price_twap,
+                )?;
+
+            all_oracles_valid &=
+                is_oracle_valid_for_action(quote_oracle_validity, Some(DriftAction::MarginCalc))?;
+
+            (
+                quote_oracle_price_data.price,
+                quote_spot_market
+                    .historical_oracle_data
+                    .last_oracle_price_twap_5min,
+            )
+        };
 
         let (oracle_price_data, oracle_validity) = oracle_map.get_price_data_and_validity(
             &market.amm.oracle,
@@ -487,9 +583,12 @@ pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
                 market_position,
                 market,
                 oracle_price_data,
+                quote_oracle_price,
+                quote_oracle_twap,
                 margin_requirement_type,
                 user_custom_margin_ratio,
                 true,
+                strict,
             )?;
 
         margin_requirement = margin_requirement.safe_add(perp_margin_requirement)?;
@@ -751,14 +850,7 @@ pub fn calculate_max_withdrawable_amount(
         // user has small dust deposit and no liabilities
         // so return early with user tokens amount
         return user
-            .get_spot_position(market_index)
-            .ok_or_else(|| {
-                msg!(
-                    "User does not have a spot balance for market {}",
-                    market_index
-                );
-                ErrorCode::CouldNotFindSpotPosition
-            })?
+            .get_spot_position(market_index)?
             .get_token_amount(spot_market)?
             .cast();
     }

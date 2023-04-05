@@ -5,7 +5,11 @@ use crate::math::casting::Cast;
 use crate::math::constants::{PRICE_PRECISION, PRICE_PRECISION_I64, PRICE_PRECISION_U64};
 use crate::math::safe_math::SafeMath;
 
+use crate::math::safe_unwrap::SafeUnwrap;
 use switchboard_v2::decimal::SwitchboardDecimal;
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Default, AnchorSerialize, AnchorDeserialize, Clone, Copy, Eq, PartialEq, Debug)]
 pub struct HistoricalOracleData {
@@ -73,15 +77,15 @@ impl HistoricalIndexData {
         }
     }
 
-    pub fn default_with_current_oracle(oracle_price_data: OraclePriceData) -> Self {
-        let price = oracle_price_data.price.cast::<u64>().unwrap();
-        HistoricalIndexData {
+    pub fn default_with_current_oracle(oracle_price_data: OraclePriceData) -> DriftResult<Self> {
+        let price = oracle_price_data.price.cast::<u64>().safe_unwrap()?;
+        Ok(HistoricalIndexData {
             last_index_bid_price: price,
             last_index_ask_price: price,
             last_index_price_twap: price,
             last_index_price_twap_5min: price,
             ..HistoricalIndexData::default()
-        }
+        })
     }
 }
 
@@ -90,6 +94,9 @@ pub enum OracleSource {
     Pyth,
     Switchboard,
     QuoteAsset,
+    Pyth1K,
+    Pyth1M,
+    PythStableCoin,
 }
 
 impl Default for OracleSource {
@@ -124,8 +131,14 @@ pub fn get_oracle_price(
     clock_slot: u64,
 ) -> DriftResult<OraclePriceData> {
     match oracle_source {
-        OracleSource::Pyth => get_pyth_price(price_oracle, clock_slot),
-        OracleSource::Switchboard => get_switchboard_price(price_oracle, clock_slot),
+        OracleSource::Pyth => get_pyth_price(price_oracle, clock_slot, 1),
+        OracleSource::Pyth1K => get_pyth_price(price_oracle, clock_slot, 1000),
+        OracleSource::Pyth1M => get_pyth_price(price_oracle, clock_slot, 1000000),
+        OracleSource::PythStableCoin => get_pyth_stable_coin_price(price_oracle, clock_slot),
+        OracleSource::Switchboard => {
+            msg!("Switchboard oracle not yet supported");
+            Err(crate::error::ErrorCode::InvalidOracle)
+        }
         OracleSource::QuoteAsset => Ok(OraclePriceData {
             price: PRICE_PRECISION_I64,
             confidence: 1,
@@ -135,7 +148,11 @@ pub fn get_oracle_price(
     }
 }
 
-pub fn get_pyth_price(price_oracle: &AccountInfo, clock_slot: u64) -> DriftResult<OraclePriceData> {
+pub fn get_pyth_price(
+    price_oracle: &AccountInfo,
+    clock_slot: u64,
+    multiple: u128,
+) -> DriftResult<OraclePriceData> {
     let pyth_price_data = price_oracle
         .try_borrow_data()
         .or(Err(crate::error::ErrorCode::UnableToLoadOracle))?;
@@ -145,6 +162,13 @@ pub fn get_pyth_price(price_oracle: &AccountInfo, clock_slot: u64) -> DriftResul
     let oracle_conf = price_data.agg.conf;
 
     let oracle_precision = 10_u128.pow(price_data.expo.unsigned_abs());
+
+    if oracle_precision <= multiple {
+        msg!("Multiple larger than oracle precision");
+        return Err(crate::error::ErrorCode::InvalidOracle);
+    }
+
+    let oracle_precision = oracle_precision.safe_div(multiple)?;
 
     let mut oracle_scale_mult = 1;
     let mut oracle_scale_div = 1;
@@ -179,47 +203,63 @@ pub fn get_pyth_price(price_oracle: &AccountInfo, clock_slot: u64) -> DriftResul
     })
 }
 
-pub fn get_switchboard_price(
-    _price_oracle: &AccountInfo,
-    _clock_slot: u64,
+pub fn get_pyth_stable_coin_price(
+    price_oracle: &AccountInfo,
+    clock_slot: u64,
 ) -> DriftResult<OraclePriceData> {
-    // updating solana/anchor cause this to make compiler complan
-    // fix when we're using switchboard again
-    panic!();
-    // let aggregator_data = AggregatorAccountData::new(price_oracle)
-    //     .or(Err(crate::error::ErrorCode::UnableToLoadOracle))?;
-    //
-    // let price = convert_switchboard_decimal(&aggregator_data.latest_confirmed_round.result)?;
-    // let confidence =
-    //     convert_switchboard_decimal(&aggregator_data.latest_confirmed_round.std_deviation)?;
-    //
-    // // std deviation should always be positive, if we get a negative make it u128::MAX so it's flagged as bad value
-    // let confidence = if confidence < 0 {
-    //     u128::MAX
-    // } else {
-    //     let price_10bps = price
-    //         .unsigned_abs()
-    //         .safe_div(1000)
-    //         ?;
-    //     max(confidence.unsigned_abs(), price_10bps)
-    // };
-    //
-    // let delay: i64 = cast_to_i64(clock_slot)?
-    //     .safe_sub(cast(
-    //         aggregator_data.latest_confirmed_round.round_open_slot,
-    //     )?)
-    //     ?;
-    //
-    // let has_sufficient_number_of_data_points =
-    //     aggregator_data.latest_confirmed_round.num_success >= aggregator_data.min_oracle_results;
-    //
-    // Ok(OraclePriceData {
-    //     price,
-    //     confidence,
-    //     delay,
-    //     has_sufficient_number_of_data_points,
-    // })
+    let mut oracle_price_data = get_pyth_price(price_oracle, clock_slot, 1)?;
+
+    let price = oracle_price_data.price;
+    let confidence = oracle_price_data.confidence;
+    let five_bps = 500_i64;
+
+    if price.safe_sub(PRICE_PRECISION_I64)?.abs() <= five_bps.min(confidence.cast()?) {
+        oracle_price_data.price = PRICE_PRECISION_I64;
+    }
+
+    Ok(oracle_price_data)
 }
+
+// pub fn get_switchboard_price(
+//     _price_oracle: &AccountInfo,
+//     _clock_slot: u64,
+// ) -> DriftResult<OraclePriceData> {
+//     updating solana/anchor cause this to make compiler complan
+//     fix when we're using switchboard again
+//     let aggregator_data = AggregatorAccountData::new(price_oracle)
+//         .or(Err(crate::error::ErrorCode::UnableToLoadOracle))?;
+//
+//     let price = convert_switchboard_decimal(&aggregator_data.latest_confirmed_round.result)?;
+//     let confidence =
+//         convert_switchboard_decimal(&aggregator_data.latest_confirmed_round.std_deviation)?;
+//
+//     // std deviation should always be positive, if we get a negative make it u128::MAX so it's flagged as bad value
+//     let confidence = if confidence < 0 {
+//         u128::MAX
+//     } else {
+//         let price_10bps = price
+//             .unsigned_abs()
+//             .safe_div(1000)
+//             ?;
+//         max(confidence.unsigned_abs(), price_10bps)
+//     };
+//
+//     let delay: i64 = cast_to_i64(clock_slot)?
+//         .safe_sub(cast(
+//             aggregator_data.latest_confirmed_round.round_open_slot,
+//         )?)
+//         ?;
+//
+//     let has_sufficient_number_of_data_points =
+//         aggregator_data.latest_confirmed_round.num_success >= aggregator_data.min_oracle_results;
+//
+//     Ok(OraclePriceData {
+//         price,
+//         confidence,
+//         delay,
+//         has_sufficient_number_of_data_points,
+//     })
+// }
 
 #[allow(dead_code)]
 /// Given a decimal number represented as a mantissa (the digits) plus an

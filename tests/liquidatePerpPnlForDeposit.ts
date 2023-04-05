@@ -10,14 +10,14 @@ import {
 	BN,
 	OracleSource,
 	ZERO,
-	AdminClient,
-	DriftClient,
+	TestClient,
 	findComputeUnitConsumption,
 	PRICE_PRECISION,
 	PositionDirection,
 	EventSubscriber,
 	OracleGuardRails,
 	LIQUIDATION_PCT_PRECISION,
+	convertToNumber,
 } from '../sdk/src';
 
 import {
@@ -31,7 +31,7 @@ import {
 	initializeSolSpotMarket,
 	printTxLogs,
 } from './testHelpers';
-import { isVariant } from '../sdk';
+import { BulkAccountLoader, isVariant, QUOTE_PRECISION } from '../sdk';
 
 describe('liquidate perp pnl for deposit', () => {
 	const provider = anchor.AnchorProvider.local(undefined, {
@@ -42,15 +42,19 @@ describe('liquidate perp pnl for deposit', () => {
 	anchor.setProvider(provider);
 	const chProgram = anchor.workspace.Drift as Program;
 
-	let driftClient: AdminClient;
-	const eventSubscriber = new EventSubscriber(connection, chProgram);
+	let driftClient: TestClient;
+	const eventSubscriber = new EventSubscriber(connection, chProgram, {
+		commitment: 'recent',
+	});
 	eventSubscriber.subscribe();
+
+	const bulkAccountLoader = new BulkAccountLoader(connection, 'confirmed', 1);
 
 	let usdcMint;
 	let userUSDCAccount;
 	let userWSOLAccount;
 
-	let liquidatorDriftClient: DriftClient;
+	let liquidatorDriftClient: TestClient;
 	let liquidatorDriftClientWSOLAccount: PublicKey;
 
 	let solOracle: PublicKey;
@@ -73,12 +77,12 @@ describe('liquidate perp pnl for deposit', () => {
 			provider,
 			// @ts-ignore
 			provider.wallet,
-			ZERO
+			new BN(5 * 10 ** 9)
 		);
 
 		solOracle = await mockOracle(1);
 
-		driftClient = new AdminClient({
+		driftClient = new TestClient({
 			connection,
 			wallet: provider.wallet,
 			programID: chProgram.programId,
@@ -94,6 +98,10 @@ describe('liquidate perp pnl for deposit', () => {
 					source: OracleSource.PYTH,
 				},
 			],
+			accountSubscription: {
+				type: 'polling',
+				accountLoader: bulkAccountLoader,
+			},
 		});
 
 		await driftClient.initialize(usdcMint.publicKey, true);
@@ -123,7 +131,7 @@ describe('liquidate perp pnl for deposit', () => {
 
 		const oracleGuardRails: OracleGuardRails = {
 			priceDivergence: {
-				markOracleDivergenceNumerator: new BN(1),
+				markOracleDivergenceNumerator: new BN(100),
 				markOracleDivergenceDenominator: new BN(10),
 			},
 			validity: {
@@ -132,26 +140,16 @@ describe('liquidate perp pnl for deposit', () => {
 				confidenceIntervalMaxSize: new BN(100000),
 				tooVolatileRatio: new BN(55), // allow 55x change
 			},
-			useForLiquidations: false,
 		};
 
 		await driftClient.updateOracleGuardRails(oracleGuardRails);
 
 		await driftClient.openPosition(
-			PositionDirection.LONG,
+			PositionDirection.SHORT,
 			new BN(10).mul(BASE_PRECISION),
 			0,
 			new BN(0)
 		);
-
-		await setFeedPrice(anchor.workspace.Pyth, 0.1, solOracle);
-		await driftClient.moveAmmToPrice(
-			0,
-			new BN(1).mul(PRICE_PRECISION).div(new BN(10))
-		);
-
-		const txSig = await driftClient.closePosition(0);
-		printTxLogs(connection, txSig);
 
 		const solAmount = new BN(1 * 10 ** 9);
 		[liquidatorDriftClient, liquidatorDriftClientWSOLAccount] =
@@ -159,7 +157,7 @@ describe('liquidate perp pnl for deposit', () => {
 				provider,
 				usdcMint,
 				chProgram,
-				solAmount,
+				solAmount.mul(new BN(2000)),
 				usdcAmount,
 				[0],
 				[0, 1],
@@ -168,13 +166,14 @@ describe('liquidate perp pnl for deposit', () => {
 						publicKey: solOracle,
 						source: OracleSource.PYTH,
 					},
-				]
+				],
+				bulkAccountLoader
 			);
 		await liquidatorDriftClient.subscribe();
 
 		const spotMarketIndex = 1;
 		await liquidatorDriftClient.deposit(
-			solAmount,
+			solAmount.mul(new BN(1000)),
 			spotMarketIndex,
 			liquidatorDriftClientWSOLAccount
 		);
@@ -190,13 +189,49 @@ describe('liquidate perp pnl for deposit', () => {
 
 	it('liquidate', async () => {
 		await setFeedPrice(anchor.workspace.Pyth, 50, solOracle);
+		await driftClient.updateInitialPctToLiquidate(
+			LIQUIDATION_PCT_PRECISION.toNumber()
+		);
+		await driftClient.updateLiquidationDuration(1);
+
+		const txSig0 = await liquidatorDriftClient.liquidatePerp(
+			await driftClient.getUserAccountPublicKey(),
+			driftClient.getUserAccount(),
+			0,
+			new BN(175).mul(BASE_PRECISION).div(new BN(10))
+		);
+
+		await printTxLogs(connection, txSig0);
+
+		try {
+			await liquidatorDriftClient.liquidatePerpPnlForDeposit(
+				await driftClient.getUserAccountPublicKey(),
+				driftClient.getUserAccount(),
+				0,
+				0,
+				usdcAmount.mul(new BN(100))
+			);
+		} catch (e) {
+			console.log('FAILED to perp pnl settle before paying off borrow');
+			// console.error(e);
+		}
+
+		// pay off borrow first (and withdraw all excess in attempt to full pay)
+		await driftClient.deposit(new BN(5.02 * 10 ** 8), 1, userWSOLAccount);
+		// await driftClient.withdraw(new BN(1 * 10 ** 8), 1, userWSOLAccount, true);
+		await driftClient.fetchAccounts();
+
+		// const u = driftClient.getUserAccount();
+		// console.log(u.spotPositions[0]);
+		// console.log(u.spotPositions[1]);
+		// console.log(u.perpPositions[0]);
 
 		const txSig = await liquidatorDriftClient.liquidatePerpPnlForDeposit(
 			await driftClient.getUserAccountPublicKey(),
 			driftClient.getUserAccount(),
 			0,
 			0,
-			usdcAmount.mul(new BN(100))
+			usdcAmount.mul(new BN(600))
 		);
 
 		const computeUnits = await findComputeUnitConsumption(
@@ -212,12 +247,23 @@ describe('liquidate perp pnl for deposit', () => {
 				.logMessages
 		);
 
-		// assert(driftClient.getUserAccount().isBeingLiquidated);
-		assert(isVariant(driftClient.getUserAccount().status, 'bankrupt'));
+		console.log('user status:', driftClient.getUserAccount().status);
+		console.log(
+			'user collateral:',
+			convertToNumber(
+				driftClient.getUser().getTotalCollateral(),
+				QUOTE_PRECISION
+			)
+		);
+		// assert(isVariant(driftClient.getUserAccount().status, 'bankrupt'));
+		assert(isVariant(driftClient.getUserAccount().status, 'beingLiquidated'));
 
 		assert(driftClient.getUserAccount().nextLiquidationId === 2);
 		assert(
 			driftClient.getUserAccount().spotPositions[0].scaledBalance.eq(ZERO)
+		);
+		assert(
+			driftClient.getUserAccount().spotPositions[1].scaledBalance.gt(ZERO)
 		);
 
 		const liquidationRecord =
@@ -236,7 +282,7 @@ describe('liquidate perp pnl for deposit', () => {
 		console.log(liquidationRecord.liquidatePerpPnlForDeposit.pnlTransfer);
 		assert(
 			liquidationRecord.liquidatePerpPnlForDeposit.pnlTransfer.eq(
-				new BN(9011005)
+				new BN(10000000)
 			)
 		);
 		assert(

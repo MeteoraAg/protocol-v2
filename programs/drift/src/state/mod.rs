@@ -10,4 +10,6 @@ pub mod spot_market;
 pub mod spot_market_map;
 #[allow(clippy::module_inception)]
 pub mod state;
+pub mod traits;
 pub mod user;
+pub mod user_map;

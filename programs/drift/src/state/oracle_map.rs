@@ -1,5 +1,5 @@
 use crate::error::{DriftResult, ErrorCode};
-use crate::ids::pyth_program;
+use crate::ids::{bonk_oracle, pyth_program, usdc_oracle};
 use crate::math::constants::PRICE_PRECISION_I64;
 use crate::math::oracle::{oracle_validity, OracleValidity};
 use crate::state::oracle::{get_oracle_price, OraclePriceData, OracleSource};
@@ -12,6 +12,7 @@ use std::iter::Peekable;
 use std::slice::Iter;
 
 use super::state::ValidityGuardRails;
+use crate::math::safe_unwrap::SafeUnwrap;
 
 pub struct AccountInfoAndOracleSource<'a> {
     /// CHECK: ownders are validated in OracleMap::load
@@ -41,13 +42,17 @@ impl<'a> OracleMap<'a> {
             .clone())
     }
 
+    fn should_get_quote_asset_price_data(&self, pubkey: &Pubkey) -> bool {
+        pubkey == &Pubkey::default()
+    }
+
     pub fn get_price_data(&mut self, pubkey: &Pubkey) -> DriftResult<&OraclePriceData> {
-        if pubkey == &Pubkey::default() {
+        if self.should_get_quote_asset_price_data(pubkey) {
             return Ok(&self.quote_asset_price_data);
         }
 
         if self.price_data.contains_key(pubkey) {
-            return Ok(self.price_data.get(pubkey).unwrap());
+            return self.price_data.get(pubkey).safe_unwrap();
         }
 
         let (account_info, oracle_source) = match self.oracles.get(pubkey) {
@@ -65,7 +70,7 @@ impl<'a> OracleMap<'a> {
 
         self.price_data.insert(*pubkey, price_data);
 
-        Ok(self.price_data.get(pubkey).unwrap())
+        self.price_data.get(pubkey).safe_unwrap()
     }
 
     pub fn get_price_data_and_validity(
@@ -73,12 +78,12 @@ impl<'a> OracleMap<'a> {
         pubkey: &Pubkey,
         last_oracle_price_twap: i64,
     ) -> DriftResult<(&OraclePriceData, OracleValidity)> {
-        if pubkey == &Pubkey::default() {
+        if self.should_get_quote_asset_price_data(pubkey) {
             return Ok((&self.quote_asset_price_data, OracleValidity::Valid));
         }
 
         if self.price_data.contains_key(pubkey) {
-            let oracle_price_data = self.price_data.get(pubkey).unwrap();
+            let oracle_price_data = self.price_data.get(pubkey).safe_unwrap()?;
             let oracle_validity = oracle_validity(
                 last_oracle_price_twap,
                 oracle_price_data,
@@ -102,7 +107,7 @@ impl<'a> OracleMap<'a> {
 
         self.price_data.insert(*pubkey, price_data);
 
-        let oracle_price_data = self.price_data.get(pubkey).unwrap();
+        let oracle_price_data = self.price_data.get(pubkey).safe_unwrap()?;
         let oracle_validity = oracle_validity(
             last_oracle_price_twap,
             oracle_price_data,
@@ -116,13 +121,13 @@ impl<'a> OracleMap<'a> {
         &mut self,
         pubkey: &Pubkey,
     ) -> DriftResult<(&OraclePriceData, &ValidityGuardRails)> {
-        if pubkey == &Pubkey::default() {
+        if self.should_get_quote_asset_price_data(pubkey) {
             let validity_guard_rails = &self.oracle_guard_rails.validity;
             return Ok((&self.quote_asset_price_data, validity_guard_rails));
         }
 
         if self.price_data.contains_key(pubkey) {
-            let oracle_price_data = self.price_data.get(pubkey).unwrap();
+            let oracle_price_data = self.price_data.get(pubkey).safe_unwrap()?;
             let validity_guard_rails = &self.oracle_guard_rails.validity;
 
             return Ok((oracle_price_data, validity_guard_rails));
@@ -143,7 +148,7 @@ impl<'a> OracleMap<'a> {
 
         self.price_data.insert(*pubkey, price_data);
 
-        let oracle_price_data = self.price_data.get(pubkey).unwrap();
+        let oracle_price_data = self.price_data.get(pubkey).safe_unwrap()?;
         let validity_guard_rails = &self.oracle_guard_rails.validity;
 
         Ok((oracle_price_data, validity_guard_rails))
@@ -158,13 +163,22 @@ impl<'a> OracleMap<'a> {
 
         while let Some(account_info) = account_info_iter.peek() {
             if account_info.owner == &pyth_program::id() {
-                let account_info = account_info_iter.next().unwrap();
+                let account_info = account_info_iter.next().safe_unwrap()?;
                 let pubkey = account_info.key();
+
+                let oracle_source = if pubkey == bonk_oracle::id() {
+                    OracleSource::Pyth1M
+                } else if pubkey == usdc_oracle::id() {
+                    OracleSource::PythStableCoin
+                } else {
+                    OracleSource::Pyth
+                };
+
                 oracles.insert(
                     pubkey,
                     AccountInfoAndOracleSource {
                         account_info: account_info.clone(),
-                        oracle_source: OracleSource::Pyth,
+                        oracle_source,
                     },
                 );
 
@@ -203,11 +217,18 @@ impl<'a> OracleMap<'a> {
 
         if account_info.owner == &pyth_program::id() {
             let pubkey = account_info.key();
+            let oracle_source = if pubkey == bonk_oracle::id() {
+                OracleSource::Pyth1M
+            } else if pubkey == usdc_oracle::id() {
+                OracleSource::PythStableCoin
+            } else {
+                OracleSource::Pyth
+            };
             oracles.insert(
                 pubkey,
                 AccountInfoAndOracleSource {
                     account_info: account_info.clone(),
-                    oracle_source: OracleSource::Pyth,
+                    oracle_source,
                 },
             );
         } else if account_info.key() != Pubkey::default() {

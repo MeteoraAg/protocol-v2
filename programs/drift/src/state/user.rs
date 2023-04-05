@@ -16,6 +16,7 @@ use crate::math_error;
 use crate::safe_increment;
 use crate::state::oracle::OraclePriceData;
 use crate::state::spot_market::{SpotBalance, SpotBalanceType, SpotMarket};
+use crate::state::traits::Size;
 use crate::validate;
 use anchor_lang::prelude::*;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -39,6 +40,11 @@ impl Default for UserStatus {
     }
 }
 
+// implement SIZE const for User
+impl Size for User {
+    const SIZE: usize = 4376;
+}
+
 #[account(zero_copy)]
 #[derive(Default, Eq, PartialEq, Debug)]
 #[repr(C)]
@@ -59,14 +65,15 @@ pub struct User {
     pub cumulative_spot_fees: i64,
     pub cumulative_perp_funding: i64,
     pub liquidation_margin_freed: u64,
-    pub liquidation_start_slot: u64,
+    pub last_active_slot: u64,
     pub next_order_id: u32,
     pub max_margin_ratio: u32,
     pub next_liquidation_id: u16,
     pub sub_account_id: u16,
     pub status: UserStatus,
     pub is_margin_trading_enabled: bool,
-    pub padding: [u8; 26],
+    pub idle: bool,
+    pub padding: [u8; 25],
 }
 
 impl User {
@@ -98,24 +105,28 @@ impl User {
             .ok_or(ErrorCode::CouldNotFindSpotPosition)
     }
 
-    pub fn get_spot_position(&self, market_index: u16) -> Option<&SpotPosition> {
+    pub fn get_spot_position(&self, market_index: u16) -> DriftResult<&SpotPosition> {
         self.get_spot_position_index(market_index)
-            .ok()
             .map(|market_index| &self.spot_positions[market_index])
     }
 
-    pub fn get_spot_position_mut(&mut self, market_index: u16) -> Option<&mut SpotPosition> {
+    pub fn get_spot_position_mut(&mut self, market_index: u16) -> DriftResult<&mut SpotPosition> {
         self.get_spot_position_index(market_index)
-            .ok()
             .map(move |market_index| &mut self.spot_positions[market_index])
     }
 
     pub fn get_quote_spot_position(&self) -> &SpotPosition {
-        self.get_spot_position(QUOTE_SPOT_MARKET_INDEX).unwrap()
+        match self.get_spot_position(QUOTE_SPOT_MARKET_INDEX) {
+            Ok(position) => position,
+            Err(_) => unreachable!(),
+        }
     }
 
     pub fn get_quote_spot_position_mut(&mut self) -> &mut SpotPosition {
-        self.get_spot_position_mut(QUOTE_SPOT_MARKET_INDEX).unwrap()
+        match self.get_spot_position_mut(QUOTE_SPOT_MARKET_INDEX) {
+            Ok(position) => position,
+            Err(_) => unreachable!(),
+        }
     }
 
     pub fn add_spot_position(
@@ -246,14 +257,13 @@ impl User {
 
         self.status = UserStatus::BeingLiquidated;
         self.liquidation_margin_freed = 0;
-        self.liquidation_start_slot = slot;
+        self.last_active_slot = slot;
         Ok(get_then_update_id!(self, next_liquidation_id))
     }
 
     pub fn exit_liquidation(&mut self) {
         self.status = UserStatus::Active;
         self.liquidation_margin_freed = 0;
-        self.liquidation_start_slot = 0;
     }
 
     pub fn enter_bankruptcy(&mut self) {
@@ -263,12 +273,18 @@ impl User {
     pub fn exit_bankruptcy(&mut self) {
         self.status = UserStatus::Active;
         self.liquidation_margin_freed = 0;
-        self.liquidation_start_slot = 0;
     }
 
     pub fn increment_margin_freed(&mut self, margin_free: u64) -> DriftResult {
         self.liquidation_margin_freed = self.liquidation_margin_freed.safe_add(margin_free)?;
         Ok(())
+    }
+
+    pub fn update_last_active_slot(&mut self, slot: u64) {
+        if !self.is_being_liquidated() {
+            self.last_active_slot = slot;
+        }
+        self.idle = false;
     }
 }
 
@@ -353,10 +369,11 @@ impl SpotPosition {
         )
     }
 
-    pub fn get_worst_case_token_amounts(
+    pub fn get_worst_case_token_amount(
         &self,
         spot_market: &SpotMarket,
         oracle_price_data: &OraclePriceData,
+        twap_5min: Option<i64>,
         token_amount: Option<i128>,
     ) -> DriftResult<(i128, i128)> {
         let token_amount = match token_amount {
@@ -368,20 +385,19 @@ impl SpotPosition {
 
         let token_amount_all_asks_fill = token_amount.safe_add(self.open_asks as i128)?;
 
+        let oracle_price = match twap_5min {
+            Some(twap_5min) => twap_5min.max(oracle_price_data.price),
+            None => oracle_price_data.price,
+        };
+
         if token_amount_all_bids_fill.abs() > token_amount_all_asks_fill.abs() {
-            let worst_case_quote_token_amount = get_token_value(
-                -self.open_bids as i128,
-                spot_market.decimals,
-                oracle_price_data.price,
-            )?;
-            Ok((token_amount_all_bids_fill, worst_case_quote_token_amount))
+            let worst_case_orders_value =
+                get_token_value(-self.open_bids as i128, spot_market.decimals, oracle_price)?;
+            Ok((token_amount_all_bids_fill, worst_case_orders_value))
         } else {
-            let worst_case_quote_token_amount = get_token_value(
-                -self.open_asks as i128,
-                spot_market.decimals,
-                oracle_price_data.price,
-            )?;
-            Ok((token_amount_all_asks_fill, worst_case_quote_token_amount))
+            let worst_case_orders_value =
+                get_token_value(-self.open_asks as i128, spot_market.decimals, oracle_price)?;
+            Ok((token_amount_all_asks_fill, worst_case_orders_value))
         }
     }
 }
@@ -633,15 +649,19 @@ impl Order {
         is_auction_complete(self.slot, self.auction_duration, slot)
     }
 
+    pub fn has_auction(&self) -> bool {
+        self.auction_duration != 0
+    }
+
     pub fn has_auction_price(
         &self,
         order_slot: u64,
         auction_duration: u8,
         slot: u64,
     ) -> DriftResult<bool> {
-        let has_auction_price =
-            self.is_market_order() && !is_auction_complete(order_slot, auction_duration, slot)?;
-        Ok(has_auction_price)
+        let auction_complete = is_auction_complete(order_slot, auction_duration, slot)?;
+        let has_auction_prices = self.auction_start_price != 0 || self.auction_end_price != 0;
+        Ok(!auction_complete && has_auction_prices)
     }
 
     /// Passing in an existing_position forces the function to consider the order's reduce only status
@@ -729,6 +749,10 @@ impl Order {
 
     pub fn is_limit_order(&self) -> bool {
         matches!(self.order_type, OrderType::Limit | OrderType::TriggerLimit)
+    }
+
+    pub fn is_resting_limit_order(&self, slot: u64) -> DriftResult<bool> {
+        Ok(self.is_limit_order() && (self.post_only || self.is_auction_complete(slot)?))
     }
 }
 
@@ -859,6 +883,10 @@ impl Default for UserStats {
     }
 }
 
+impl Size for UserStats {
+    const SIZE: usize = 240;
+}
+
 impl UserStats {
     pub fn update_maker_volume_30d(&mut self, quote_asset_amount: u64, now: i64) -> DriftResult {
         let since_last = max(1_i64, now.safe_sub(self.last_maker_volume_30d_ts)?);
@@ -950,4 +978,18 @@ impl UserStats {
     pub fn get_total_30d_volume(&self) -> DriftResult<u64> {
         self.taker_volume_30d.safe_add(self.maker_volume_30d)
     }
+}
+
+#[account(zero_copy)]
+#[derive(Default, Eq, PartialEq, Debug)]
+#[repr(C)]
+pub struct ReferrerName {
+    pub authority: Pubkey,
+    pub user: Pubkey,
+    pub user_stats: Pubkey,
+    pub name: [u8; 32],
+}
+
+impl Size for ReferrerName {
+    const SIZE: usize = 136;
 }

@@ -7,7 +7,7 @@ use crate::math::bn::U192;
 use crate::math::casting::Cast;
 use crate::math::constants::{
     AMM_RESERVE_PRECISION, AMM_TO_QUOTE_PRECISION_RATIO_I128, K_BPS_UPDATE_SCALE,
-    MAX_K_BPS_DECREASE, PEG_PRECISION, PERCENTAGE_PRECISION_I128, QUOTE_PRECISION,
+    MAX_K_BPS_DECREASE, MAX_SQRT_K, PEG_PRECISION, PERCENTAGE_PRECISION_I128, QUOTE_PRECISION,
 };
 use crate::math::position::{_calculate_base_asset_value_and_pnl, calculate_base_asset_value};
 use crate::math::safe_math::SafeMath;
@@ -165,7 +165,6 @@ pub fn _calculate_budgeted_k_scale(
 
     Ok((numerator.cast::<u128>()?, denominator.cast::<u128>()?))
 }
-
 /// To find the cost of adjusting k, compare the the net market value before and after adjusting k
 /// Increasing k costs the protocol terminal money because it reduces slippage and improves the exit price for net market position
 /// Decreasing k relieves the protocol terminal money because it increases slippage and hurts the exit price for net market position
@@ -245,7 +244,14 @@ pub fn get_update_k_result(
         sqrt_k_ratio = sqrt_k_ratio + 1;
     }
 
-    let sqrt_k = new_sqrt_k.try_to_u128().unwrap();
+    let sqrt_k = new_sqrt_k.try_to_u128()?;
+
+    validate!(
+        sqrt_k_ratio < sqrt_k_ratio_precision || sqrt_k <= MAX_SQRT_K,
+        ErrorCode::InvalidUpdateK,
+        "cannot increase sqrt_k={} past MAX_SQRT_K",
+        sqrt_k
+    )?;
 
     // only allow too small when market is in reduce only mode
     if market.status != MarketStatus::ReduceOnly

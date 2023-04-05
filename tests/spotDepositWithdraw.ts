@@ -6,9 +6,8 @@ import { Program } from '@project-serum/anchor';
 import { LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
 
 import {
-	AdminClient,
+	TestClient,
 	BN,
-	DriftClient,
 	EventSubscriber,
 	SPOT_MARKET_RATE_PRECISION,
 	SpotBalanceType,
@@ -42,27 +41,36 @@ import {
 	ONE,
 	SPOT_MARKET_BALANCE_PRECISION,
 	PRICE_PRECISION,
+	BulkAccountLoader,
 } from '../sdk';
 import { PRICE_PRECISION } from '@drift-labs/sdk';
 
 describe('spot deposit and withdraw', () => {
-	const provider = anchor.AnchorProvider.local();
+	const provider = anchor.AnchorProvider.local(undefined, {
+		preflightCommitment: 'confirmed',
+		skipPreflight: false,
+		commitment: 'confirmed',
+	});
 	const connection = provider.connection;
 	anchor.setProvider(provider);
 	const chProgram = anchor.workspace.Drift as Program;
 
-	let admin: AdminClient;
-	const eventSubscriber = new EventSubscriber(connection, chProgram);
+	let admin: TestClient;
+	const eventSubscriber = new EventSubscriber(connection, chProgram, {
+		commitment: 'recent',
+	});
 	eventSubscriber.subscribe();
+
+	const bulkAccountLoader = new BulkAccountLoader(connection, 'confirmed', 1);
 
 	let solOracle: PublicKey;
 
 	let usdcMint;
 
-	let firstUserDriftClient: DriftClient;
+	let firstUserDriftClient: TestClient;
 	let firstUserDriftClientUSDCAccount: PublicKey;
 
-	let secondUserDriftClient: DriftClient;
+	let secondUserDriftClient: TestClient;
 	let secondUserDriftClientWSOLAccount: PublicKey;
 	let secondUserDriftClientUSDCAccount: PublicKey;
 
@@ -85,7 +93,7 @@ describe('spot deposit and withdraw', () => {
 		spotMarketIndexes = [0, 1];
 		oracleInfos = [{ publicKey: solOracle, source: OracleSource.PYTH }];
 
-		admin = new AdminClient({
+		admin = new TestClient({
 			connection,
 			wallet: provider.wallet,
 			programID: chProgram.programId,
@@ -96,6 +104,10 @@ describe('spot deposit and withdraw', () => {
 			perpMarketIndexes: marketIndexes,
 			spotMarketIndexes: spotMarketIndexes,
 			oracleInfos,
+			accountSubscription: {
+				type: 'polling',
+				accountLoader: bulkAccountLoader,
+			},
 		});
 
 		await admin.initialize(usdcMint.publicKey, true);
@@ -251,7 +263,8 @@ describe('spot deposit and withdraw', () => {
 				usdcAmount,
 				marketIndexes,
 				spotMarketIndexes,
-				oracleInfos
+				oracleInfos,
+				bulkAccountLoader
 			);
 
 		const marketIndex = 0;
@@ -303,7 +316,8 @@ describe('spot deposit and withdraw', () => {
 			ZERO,
 			marketIndexes,
 			spotMarketIndexes,
-			oracleInfos
+			oracleInfos,
+			bulkAccountLoader
 		);
 
 		const marketIndex = 1;
@@ -655,9 +669,7 @@ describe('spot deposit and withdraw', () => {
 			userBalanceAfter.scaledBalance.toString()
 		);
 
-		assert(
-			expectedUserBalance.eq(userBalanceAfter.scaledBalance.add(new BN(1000)))
-		);
+		assert(expectedUserBalance.eq(userBalanceAfter.scaledBalance));
 		assert(isVariant(userBalanceAfter.balanceType, 'deposit'));
 
 		const expectedSpotMarketDepositBalance =
@@ -669,9 +681,7 @@ describe('spot deposit and withdraw', () => {
 		);
 
 		assert(
-			spotMarketAccount.depositBalance.eq(
-				expectedSpotMarketDepositBalance.sub(new BN(1000))
-			)
+			spotMarketAccount.depositBalance.eq(expectedSpotMarketDepositBalance)
 		);
 		assert(spotMarketAccount.borrowBalance.eq(ZERO));
 	});
@@ -766,7 +776,7 @@ describe('spot deposit and withdraw', () => {
 			expectedUserUSDCAmount.toString(),
 			userUSDCAmountAfter.toString()
 		);
-		assert(expectedUserUSDCAmount.eq(userUSDCAmountAfter.add(ONE)));
+		assert(expectedUserUSDCAmount.eq(userUSDCAmountAfter));
 
 		const userBalanceAfter = secondUserDriftClient.getSpotPosition(marketIndex);
 		assert(userBalanceAfter.scaledBalance.eq(ZERO));
@@ -833,11 +843,13 @@ describe('spot deposit and withdraw', () => {
 			largeUsdcAmount,
 			marketIndexes,
 			spotMarketIndexes,
-			oracleInfos
+			oracleInfos,
+			bulkAccountLoader
 		);
 
 		const marketIndex = 0;
 
+		await thirdUserDriftClient.fetchAccounts();
 		const spotPosition = thirdUserDriftClient.getSpotPosition(marketIndex);
 		console.log(spotPosition);
 		assert(spotPosition.scaledBalance.eq(ZERO));
