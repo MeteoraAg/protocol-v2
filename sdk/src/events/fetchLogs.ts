@@ -5,6 +5,7 @@ import {
 	PublicKey,
 	TransactionResponse,
 	TransactionSignature,
+	VersionedTransactionResponse,
 } from '@solana/web3.js';
 import { WrappedEvents } from './types';
 
@@ -18,7 +19,9 @@ type FetchLogsResponse = {
 	mostRecentBlockTime: number | undefined;
 };
 
-function mapTransactionResponseToLog(transaction: TransactionResponse): Log {
+function mapTransactionResponseToLog(
+	transaction: TransactionResponse | VersionedTransactionResponse
+): Log {
 	return {
 		txSig: transaction.transaction.signatures[0],
 		slot: transaction.slot,
@@ -58,12 +61,15 @@ export async function fetchLogs(
 
 	const chunkedSignatures = chunk(filteredSignatures, 100);
 
+	const config = { commitment: finality, maxSupportedTransactionVersion: 0 };
+
 	const transactionLogs = (
 		await Promise.all(
 			chunkedSignatures.map(async (chunk) => {
 				const transactions = await connection.getTransactions(
 					chunk.map((confirmedSignature) => confirmedSignature.signature),
-					finality
+					//@ts-ignore
+					config
 				);
 
 				return transactions.reduce((logs, transaction) => {

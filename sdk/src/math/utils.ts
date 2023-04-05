@@ -1,33 +1,35 @@
-import { BN } from '../';
+import { BN, ONE, ZERO } from '../';
 
 export function clampBN(x: BN, min: BN, max: BN): BN {
 	return BN.max(min, BN.min(x, max));
 }
 
-export const squareRootBN = (n, closeness = new BN(1)): BN => {
-	// Assuming the sqrt of n as n only
-	let x = n;
-
-	// The closed guess will be stored in the root
-	let root;
-
-	// To count the number of iterations
-	let count = 0;
-	const TWO = new BN(2);
-
-	// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-	while (count < Number.MAX_SAFE_INTEGER) {
-		count++;
-
-		// Calculate more closed x
-		root = x.add(n.div(x)).div(TWO);
-
-		// Check for closeness
-		if (x.sub(root).abs().lte(closeness)) break;
-
-		// Update root
-		x = root;
+export const squareRootBN = (n: BN): BN => {
+	if (n.lt(new BN(0))) {
+		throw new Error('Sqrt only works on non-negtiave inputs');
+	}
+	if (n.lt(new BN(2))) {
+		return n;
 	}
 
-	return root;
+	const smallCand = squareRootBN(n.shrn(2)).shln(1);
+	const largeCand = smallCand.add(new BN(1));
+
+	if (largeCand.mul(largeCand).gt(n)) {
+		return smallCand;
+	} else {
+		return largeCand;
+	}
+};
+
+export const divCeil = (a: BN, b: BN): BN => {
+	const quotient = a.div(b);
+
+	const remainder = a.mod(b);
+
+	if (remainder.gt(ZERO)) {
+		return quotient.add(ONE);
+	} else {
+		return quotient;
+	}
 };

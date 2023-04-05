@@ -6,9 +6,9 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::error::DriftResult;
 use crate::instructions::SpotFulfillmentType;
-#[cfg(test)]
-use crate::math::constants::SPOT_CUMULATIVE_INTEREST_PRECISION;
 use crate::math::constants::{AMM_RESERVE_PRECISION, MARGIN_PRECISION, SPOT_WEIGHT_PRECISION_U128};
+#[cfg(test)]
+use crate::math::constants::{PRICE_PRECISION_I64, SPOT_CUMULATIVE_INTEREST_PRECISION};
 use crate::math::margin::{
     calculate_size_discount_asset_weight, calculate_size_premium_liability_weight,
     MarginRequirementType,
@@ -18,6 +18,7 @@ use crate::math::spot_balance::get_token_amount;
 
 use crate::state::oracle::{HistoricalIndexData, HistoricalOracleData, OracleSource};
 use crate::state::perp_market::{MarketStatus, PoolBalance};
+use crate::state::traits::{MarketIndexOffset, Size};
 
 #[account(zero_copy)]
 #[derive(PartialEq, Eq, Debug)]
@@ -101,7 +102,7 @@ impl Default for SpotMarket {
             last_interest_ts: 0,
             last_twap_ts: 0,
             expiry_ts: 0,
-            order_step_size: 0,
+            order_step_size: 1,
             order_tick_size: 0,
             min_order_size: 0,
             max_position_size: 0,
@@ -126,6 +127,14 @@ impl Default for SpotMarket {
             padding: [0; 86],
         }
     }
+}
+
+impl Size for SpotMarket {
+    const SIZE: usize = 776;
+}
+
+impl MarketIndexOffset for SpotMarket {
+    const MARKET_INDEX_OFFSET: usize = 684;
 }
 
 impl SpotMarket {
@@ -164,14 +173,20 @@ impl SpotMarket {
         } else {
             (size * AMM_RESERVE_PRECISION) / size_precision
         };
-        let asset_weight = match margin_requirement_type {
-            MarginRequirementType::Initial => calculate_size_discount_asset_weight(
-                size_in_amm_reserve_precision,
-                self.imf_factor,
-                self.initial_asset_weight,
-            )?,
+
+        let default_asset_weight = match margin_requirement_type {
+            MarginRequirementType::Initial => self.initial_asset_weight,
             MarginRequirementType::Maintenance => self.maintenance_asset_weight,
         };
+
+        let size_based_asset_weight = calculate_size_discount_asset_weight(
+            size_in_amm_reserve_precision,
+            self.imf_factor,
+            default_asset_weight,
+        )?;
+
+        let asset_weight = size_based_asset_weight.min(default_asset_weight);
+
         Ok(asset_weight)
     }
 
@@ -262,6 +277,11 @@ impl SpotMarket {
             maintenance_asset_weight: 10000,
             order_tick_size: 1,
             status: MarketStatus::Active,
+            historical_oracle_data: HistoricalOracleData {
+                last_oracle_price_twap: PRICE_PRECISION_I64,
+                last_oracle_price_twap_5min: PRICE_PRECISION_I64,
+                ..HistoricalOracleData::default()
+            },
             ..SpotMarket::default()
         }
     }
@@ -323,6 +343,10 @@ pub struct SerumV3FulfillmentConfig {
     pub padding: [u8; 4],
 }
 
+impl Size for SerumV3FulfillmentConfig {
+    const SIZE: usize = 344;
+}
+
 #[derive(Clone, Copy, BorshSerialize, BorshDeserialize, PartialEq, Debug, Eq)]
 pub enum SpotFulfillmentConfigStatus {
     Enabled,
@@ -335,7 +359,7 @@ impl Default for SpotFulfillmentConfigStatus {
     }
 }
 
-#[derive(Clone, Copy, BorshSerialize, BorshDeserialize, PartialEq, Debug, Eq)]
+#[derive(Clone, Copy, BorshSerialize, BorshDeserialize, PartialEq, Debug, Eq, PartialOrd, Ord)]
 pub enum AssetTier {
     Collateral, // full priviledge
     Protected,  // collateral, but no borrow

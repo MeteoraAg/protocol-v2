@@ -55,6 +55,13 @@ pub mod drift {
         handle_initialize_user_stats(ctx)
     }
 
+    pub fn initialize_referrer_name(
+        ctx: Context<InitializeReferrerName>,
+        name: [u8; 32],
+    ) -> Result<()> {
+        handle_initialize_referrer_name(ctx, name)
+    }
+
     pub fn deposit(
         ctx: Context<Deposit>,
         market_index: u16,
@@ -110,8 +117,8 @@ pub mod drift {
         handle_place_and_take_perp_order(ctx, params, maker_order_id)
     }
 
-    pub fn place_and_make_perp_order(
-        ctx: Context<PlaceAndMake>,
+    pub fn place_and_make_perp_order<'a, 'b, 'c, 'info>(
+        ctx: Context<'a, 'b, 'c, 'info, PlaceAndMake<'info>>,
         params: OrderParams,
         taker_order_id: u32,
     ) -> Result<()> {
@@ -205,13 +212,17 @@ pub mod drift {
     pub fn fill_perp_order(
         ctx: Context<FillOrder>,
         order_id: Option<u32>,
-        maker_order_id: Option<u32>,
+        _maker_order_id: Option<u32>,
     ) -> Result<()> {
-        handle_fill_perp_order(ctx, order_id, maker_order_id)
+        handle_fill_perp_order(ctx, order_id)
     }
 
-    pub fn fill_spot_order(
-        ctx: Context<FillOrder>,
+    pub fn revert_fill(ctx: Context<RevertFill>) -> Result<()> {
+        handle_revert_fill(ctx)
+    }
+
+    pub fn fill_spot_order<'a, 'b, 'c, 'info>(
+        ctx: Context<'a, 'b, 'c, 'info, FillOrder<'info>>,
         order_id: Option<u32>,
         fulfillment_type: Option<SpotFulfillmentType>,
         maker_order_id: Option<u32>,
@@ -225,6 +236,10 @@ pub mod drift {
 
     pub fn force_cancel_orders(ctx: Context<ForceCancelOrder>) -> Result<()> {
         handle_force_cancel_orders(ctx)
+    }
+
+    pub fn update_user_idle(ctx: Context<UpdateUserIdle>) -> Result<()> {
+        handle_update_user_idle(ctx)
     }
 
     pub fn settle_pnl(ctx: Context<SettlePNL>, market_index: u16) -> Result<()> {
@@ -829,9 +844,6 @@ pub mod drift {
         handle_update_perp_market_name(ctx, name)
     }
 
-    #[access_control(
-        market_valid(&ctx.accounts.perp_market)
-    )]
     pub fn update_perp_market_min_order_size(
         ctx: Context<AdminUpdatePerpMarket>,
         order_size: u64,
@@ -880,7 +892,7 @@ pub mod drift {
 
     pub fn update_exchange_status(
         ctx: Context<AdminUpdateState>,
-        exchange_status: ExchangeStatus,
+        exchange_status: u8,
     ) -> Result<()> {
         handle_update_exchange_status(ctx, exchange_status)
     }

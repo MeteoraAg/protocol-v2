@@ -3,6 +3,7 @@ use std::ops::{Deref, DerefMut};
 use anchor_lang::prelude::*;
 use solana_program::msg;
 
+use crate::controller::amm::get_fee_pool_tokens;
 use crate::controller::funding::settle_funding_payment;
 use crate::controller::lp::burn_lp_shares;
 use crate::controller::orders;
@@ -35,8 +36,8 @@ use crate::math::liquidation::{
     validate_transfer_satisfies_limit_price, LiquidationMultiplierType,
 };
 use crate::math::margin::{
-    calculate_margin_requirement_and_total_collateral, meets_initial_margin_requirement,
-    MarginRequirementType,
+    calculate_margin_requirement_and_total_collateral, calculate_user_safest_position_tiers,
+    meets_initial_margin_requirement, MarginRequirementType,
 };
 use crate::math::oracle::DriftAction;
 use crate::math::orders::{
@@ -304,6 +305,8 @@ pub fn liquidate_perp(
     let market = perp_market_map.get_ref(&market_index)?;
     let liquidation_fee = market.liquidator_fee;
     let if_liquidation_fee = market.if_liquidation_fee;
+    let quote_spot_market = spot_market_map.get_ref(&market.quote_spot_market_index)?;
+    let quote_oracle_price = oracle_map.get_price_data(&quote_spot_market.oracle)?.price;
     let base_asset_amount_to_cover_margin_shortage = standardize_base_asset_amount_ceil(
         calculate_base_asset_amount_to_cover_margin_shortage(
             margin_shortage,
@@ -311,10 +314,12 @@ pub fn liquidate_perp(
             liquidation_fee,
             if_liquidation_fee,
             oracle_price,
+            quote_oracle_price,
         )?,
         market.amm.order_step_size,
     )?;
     drop(market);
+    drop(quote_spot_market);
 
     let max_pct_allowed = calculate_max_pct_to_liquidate(
         user,
@@ -412,7 +417,7 @@ pub fn liquidate_perp(
     ) = {
         let mut market = perp_market_map.get_ref_mut(&market_index)?;
 
-        let user_position = user.get_perp_position_mut(market_index).unwrap();
+        let user_position = user.get_perp_position_mut(market_index)?;
         let user_existing_position_direction = user_position.get_direction();
         let user_position_direction_to_close = user_position.get_direction_to_close();
         update_position_and_market(user_position, &mut market, &user_position_delta)?;
@@ -430,9 +435,7 @@ pub fn liquidate_perp(
             market.amm.order_step_size
         )?;
 
-        let liquidator_position = liquidator
-            .force_get_perp_position_mut(market_index)
-            .unwrap();
+        let liquidator_position = liquidator.force_get_perp_position_mut(market_index)?;
         let liquidator_existing_position_direction = liquidator_position.get_direction();
         update_position_and_market(liquidator_position, &mut market, &liquidator_position_delta)?;
         update_quote_asset_and_break_even_amount(
@@ -641,7 +644,7 @@ pub fn liquidate_spot(
     )?;
 
     // validate user and liquidator have spot balances
-    user.get_spot_position(asset_market_index).ok_or_else(|| {
+    user.get_spot_position(asset_market_index).map_err(|_| {
         msg!(
             "User does not have a spot balance for asset market {}",
             asset_market_index
@@ -650,7 +653,7 @@ pub fn liquidate_spot(
     })?;
 
     user.get_spot_position(liability_market_index)
-        .ok_or_else(|| {
+        .map_err(|_| {
             msg!(
                 "User does not have a spot balance for liability market {}",
                 liability_market_index
@@ -685,7 +688,7 @@ pub fn liquidate_spot(
             Some(DriftAction::Liquidate),
         )?;
 
-        let spot_deposit_position = user.get_spot_position(asset_market_index).unwrap();
+        let spot_deposit_position = user.get_spot_position(asset_market_index)?;
 
         validate!(
             spot_deposit_position.balance_type == SpotBalanceType::Deposit,
@@ -735,7 +738,7 @@ pub fn liquidate_spot(
             Some(DriftAction::Liquidate),
         )?;
 
-        let spot_position = user.get_spot_position(liability_market_index).unwrap();
+        let spot_position = user.get_spot_position(liability_market_index)?;
 
         validate!(
             spot_position.balance_type == SpotBalanceType::Borrow,
@@ -980,7 +983,7 @@ pub fn liquidate_spot(
             liability_transfer.safe_sub(if_fee)?,
             &SpotBalanceType::Deposit,
             &mut liability_market,
-            user.get_spot_position_mut(liability_market_index).unwrap(),
+            user.get_spot_position_mut(liability_market_index)?,
             false,
             Some(liability_transfer.safe_sub(if_fee)?),
         )?;
@@ -991,9 +994,7 @@ pub fn liquidate_spot(
             liability_transfer,
             &SpotBalanceType::Borrow,
             &mut liability_market,
-            liquidator
-                .get_spot_position_mut(liability_market_index)
-                .unwrap(),
+            liquidator.get_spot_position_mut(liability_market_index)?,
             false,
             Some(liability_transfer),
         )?;
@@ -1115,7 +1116,7 @@ pub fn liquidate_borrow_for_perp_pnl(
     })?;
 
     user.get_spot_position(liability_market_index)
-        .ok_or_else(|| {
+        .map_err(|_| {
             msg!(
                 "User does not have a spot balance for liability market {}",
                 liability_market_index
@@ -1152,7 +1153,7 @@ pub fn liquidate_borrow_for_perp_pnl(
     )?;
 
     let (pnl, quote_price, quote_decimals, pnl_asset_weight, pnl_liquidation_multiplier) = {
-        let user_position = user.get_perp_position(perp_market_index).unwrap();
+        let user_position = user.get_perp_position(perp_market_index)?;
 
         let base_asset_amount = user_position.base_asset_amount;
 
@@ -1177,9 +1178,10 @@ pub fn liquidate_borrow_for_perp_pnl(
             "Perp position must have position pnl"
         )?;
 
-        let quote_price = oracle_map.quote_asset_price_data.price;
-
         let market = perp_market_map.get_ref(&perp_market_index)?;
+
+        let quote_spot_market = spot_market_map.get_ref(&market.quote_spot_market_index)?;
+        let quote_price = oracle_map.get_price_data(&quote_spot_market.oracle)?.price;
 
         let pnl_asset_weight =
             market.get_unrealized_asset_weight(pnl, MarginRequirementType::Maintenance)?;
@@ -1215,7 +1217,7 @@ pub fn liquidate_borrow_for_perp_pnl(
             Some(DriftAction::Liquidate),
         )?;
 
-        let spot_position = user.get_spot_position(liability_market_index).unwrap();
+        let spot_position = user.get_spot_position(liability_market_index)?;
 
         validate!(
             spot_position.balance_type == SpotBalanceType::Borrow,
@@ -1554,7 +1556,8 @@ pub fn liquidate_perp_pnl_for_deposit(
 ) -> DriftResult {
     // liquidator takes over remaining negative perpetual pnl in exchange for a user deposit
     // can only be done once the perpetual position's size is 0
-    // blocked when the user deposit oracle is deemed invalid
+    // blocked when 1) user deposit oracle is deemed invalid
+    // or 2) user has outstanding liability with higher tier
 
     validate!(
         !user.is_bankrupt(),
@@ -1576,7 +1579,7 @@ pub fn liquidate_perp_pnl_for_deposit(
         e
     })?;
 
-    user.get_spot_position(asset_market_index).ok_or_else(|| {
+    user.get_spot_position(asset_market_index).map_err(|_| {
         msg!(
             "User does not have a spot balance for asset market {}",
             asset_market_index
@@ -1612,7 +1615,14 @@ pub fn liquidate_perp_pnl_for_deposit(
         now,
     )?;
 
-    let (asset_amount, asset_price, asset_decimals, asset_weight, asset_liquidation_multiplier) = {
+    let (
+        asset_amount,
+        asset_price,
+        _asset_tier,
+        asset_decimals,
+        asset_weight,
+        asset_liquidation_multiplier,
+    ) = {
         let mut asset_market = spot_market_map.get_ref_mut(&asset_market_index)?;
         let (asset_price_data, validity_guard_rails) =
             oracle_map.get_price_data_and_guard_rails(&asset_market.oracle)?;
@@ -1626,7 +1636,7 @@ pub fn liquidate_perp_pnl_for_deposit(
         )?;
 
         let token_price = asset_price_data.price;
-        let spot_position = user.get_spot_position(asset_market_index).unwrap();
+        let spot_position = user.get_spot_position(asset_market_index)?;
 
         validate!(
             spot_position.balance_type == SpotBalanceType::Deposit,
@@ -1646,6 +1656,7 @@ pub fn liquidate_perp_pnl_for_deposit(
         (
             token_amount,
             token_price,
+            asset_market.asset_tier,
             asset_market.decimals,
             asset_market.maintenance_asset_weight,
             calculate_liquidation_multiplier(
@@ -1658,11 +1669,12 @@ pub fn liquidate_perp_pnl_for_deposit(
     let (
         unsettled_pnl,
         quote_price,
+        contract_tier,
         quote_decimals,
         pnl_liability_weight,
         pnl_liquidation_multiplier,
     ) = {
-        let user_position = user.get_perp_position(perp_market_index).unwrap();
+        let user_position = user.get_perp_position(perp_market_index)?;
 
         let base_asset_amount = user_position.base_asset_amount;
 
@@ -1687,13 +1699,15 @@ pub fn liquidate_perp_pnl_for_deposit(
             "Perp position must have negative pnl"
         )?;
 
-        let quote_price = oracle_map.quote_asset_price_data.price;
-
         let market = perp_market_map.get_ref(&perp_market_index)?;
+
+        let quote_spot_market = spot_market_map.get_ref(&market.quote_spot_market_index)?;
+        let quote_price = oracle_map.get_price_data(&quote_spot_market.oracle)?.price;
 
         (
             unsettled_pnl.unsigned_abs(),
             quote_price,
+            market.contract_tier,
             6_u32,
             SPOT_WEIGHT_PRECISION,
             calculate_liquidation_multiplier(
@@ -1740,6 +1754,10 @@ pub fn liquidate_perp_pnl_for_deposit(
         None,
     )?;
 
+    let (safest_tier_spot_liability, safest_tier_perp_liability) =
+        calculate_user_safest_position_tiers(user, perp_market_map, spot_market_map)?;
+    let is_contract_tier_violation =
+        !(contract_tier.is_as_safe_as(&safest_tier_perp_liability, &safest_tier_spot_liability));
     // check if user exited liquidation territory
     let (intermediate_total_collateral, intermediate_margin_requirement_with_buffer) =
         if !canceled_order_ids.is_empty() {
@@ -1765,9 +1783,10 @@ pub fn liquidate_perp_pnl_for_deposit(
                 .cast::<u64>()?;
             user.increment_margin_freed(margin_freed)?;
 
-            if intermediate_total_collateral
-                >= intermediate_margin_requirement_plus_buffer.cast()?
-            {
+            let exiting_liq_territory = intermediate_total_collateral
+                >= intermediate_margin_requirement_plus_buffer.cast()?;
+
+            if exiting_liq_territory || is_contract_tier_violation {
                 let market = perp_market_map.get_ref(&perp_market_index)?;
                 let market_oracle_price = oracle_map.get_price_data(&market.amm.oracle)?.price;
 
@@ -1793,7 +1812,17 @@ pub fn liquidate_perp_pnl_for_deposit(
                     ..LiquidationRecord::default()
                 });
 
-                user.exit_liquidation();
+                if exiting_liq_territory {
+                    user.exit_liquidation();
+                } else if is_contract_tier_violation {
+                    msg!(
+                        "return early after cancel orders: liquidating contract tier={:?} pnl is riskier than outstanding {:?} & {:?}",
+                        contract_tier,
+                        safest_tier_perp_liability,
+                        safest_tier_spot_liability
+                    );
+                }
+
                 return Ok(());
             }
 
@@ -1804,6 +1833,16 @@ pub fn liquidate_perp_pnl_for_deposit(
         } else {
             (total_collateral, margin_requirement_plus_buffer)
         };
+
+    if is_contract_tier_violation {
+        msg!(
+            "liquidating contract tier={:?} pnl is riskier than outstanding {:?} & {:?}",
+            contract_tier,
+            safest_tier_perp_liability,
+            safest_tier_spot_liability
+        );
+        return Err(ErrorCode::TierViolationLiquidatingPerpPnl);
+    }
 
     let margin_shortage = calculate_margin_shortage(
         intermediate_margin_requirement_with_buffer,
@@ -1906,9 +1945,7 @@ pub fn liquidate_perp_pnl_for_deposit(
             asset_transfer,
             &SpotBalanceType::Deposit,
             &mut asset_market,
-            liquidator
-                .get_spot_position_mut(asset_market_index)
-                .unwrap(),
+            liquidator.get_spot_position_mut(asset_market_index)?,
             false,
             Some(asset_transfer),
         )?;
@@ -1917,7 +1954,7 @@ pub fn liquidate_perp_pnl_for_deposit(
             asset_transfer,
             &SpotBalanceType::Borrow,
             &mut asset_market,
-            user.get_spot_position_mut(asset_market_index).unwrap(),
+            user.get_spot_position_mut(asset_market_index)?,
             false,
             Some(asset_transfer),
         )?;
@@ -2030,8 +2067,7 @@ pub fn resolve_perp_bankruptcy(
     })?;
 
     let loss = user
-        .get_perp_position(market_index)
-        .unwrap()
+        .get_perp_position(market_index)?
         .quote_asset_amount
         .cast::<i128>()?;
 
@@ -2088,7 +2124,48 @@ pub fn resolve_perp_bankruptcy(
         if_payment
     };
 
-    let loss_to_socialize = loss.safe_add(if_payment.cast::<i128>()?)?;
+    let losses_remaining: i128 = loss.safe_add(if_payment.cast::<i128>()?)?;
+    validate!(
+        losses_remaining <= 0,
+        ErrorCode::InvalidPerpPositionToLiquidate,
+        "losses_remaining must be non-positive"
+    )?;
+
+    let fee_pool_payment: i128 = if losses_remaining < 0 {
+        let perp_market = &mut perp_market_map.get_ref_mut(&market_index)?;
+        let spot_market = &mut spot_market_map.get_ref_mut(&QUOTE_SPOT_MARKET_INDEX)?;
+        let fee_pool_tokens = get_fee_pool_tokens(perp_market, spot_market)?;
+        msg!("fee_pool_tokens={:?}", fee_pool_tokens);
+
+        losses_remaining.abs().min(fee_pool_tokens.cast()?)
+    } else {
+        0
+    };
+    validate!(
+        fee_pool_payment >= 0,
+        ErrorCode::InvalidPerpPositionToLiquidate,
+        "fee_pool_payment must be non-negative"
+    )?;
+
+    if fee_pool_payment > 0 {
+        let perp_market = &mut perp_market_map.get_ref_mut(&market_index)?;
+        let spot_market = &mut spot_market_map.get_ref_mut(&QUOTE_SPOT_MARKET_INDEX)?;
+        msg!("fee_pool_payment={:?}", fee_pool_payment);
+        update_spot_balances(
+            fee_pool_payment.unsigned_abs(),
+            &SpotBalanceType::Borrow,
+            spot_market,
+            &mut perp_market.amm.fee_pool,
+            false,
+        )?;
+    }
+
+    let loss_to_socialize = losses_remaining.safe_add(fee_pool_payment.cast::<i128>()?)?;
+    validate!(
+        loss_to_socialize <= 0,
+        ErrorCode::InvalidPerpPositionToLiquidate,
+        "loss_to_socialize must be non-positive"
+    )?;
 
     let cumulative_funding_rate_delta = calculate_funding_rate_deltas_to_resolve_bankruptcy(
         loss_to_socialize,
@@ -2194,7 +2271,7 @@ pub fn resolve_spot_bankruptcy(
     )?;
 
     // validate user and liquidator have spot position balances
-    user.get_spot_position(market_index).ok_or_else(|| {
+    user.get_spot_position(market_index).map_err(|_| {
         msg!(
             "User does not have a spot balance for market {}",
             market_index
@@ -2213,7 +2290,7 @@ pub fn resolve_spot_bankruptcy(
         )?;
 
     let borrow_amount = {
-        let spot_position = user.get_spot_position(market_index).unwrap();
+        let spot_position = user.get_spot_position(market_index)?;
         validate!(
             spot_position.balance_type == SpotBalanceType::Borrow,
             ErrorCode::UserHasInvalidBorrow
@@ -2249,7 +2326,7 @@ pub fn resolve_spot_bankruptcy(
         )?;
         user.increment_total_socialized_loss(quote_social_loss.unsigned_abs().cast()?)?;
 
-        let spot_position = user.get_spot_position_mut(market_index).unwrap();
+        let spot_position = user.get_spot_position_mut(market_index)?;
         update_spot_balances_and_cumulative_deposits(
             borrow_amount,
             &SpotBalanceType::Deposit,

@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Token, TokenAccount};
 
+use crate::controller::serum::FulfillmentParams;
 use crate::error::ErrorCode;
 use crate::instructions::constraints::*;
 use crate::instructions::optional_accounts::{
@@ -22,19 +23,17 @@ use crate::state::spot_market::SpotMarket;
 use crate::state::spot_market_map::{
     get_writable_spot_market_set, get_writable_spot_market_set_from_many,
 };
-use crate::state::state::{ExchangeStatus, State};
+use crate::state::state::State;
 use crate::state::user::{MarketType, User, UserStats};
+use crate::state::user_map::load_user_maps;
 use crate::validate;
+use crate::validation::user::validate_user_is_idle;
 use crate::{controller, load, math};
 
 #[access_control(
     fill_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_fill_perp_order<'info>(
-    ctx: Context<FillOrder>,
-    order_id: Option<u32>,
-    maker_order_id: Option<u32>,
-) -> Result<()> {
+pub fn handle_fill_perp_order<'info>(ctx: Context<FillOrder>, order_id: Option<u32>) -> Result<()> {
     let (order_id, market_index) = {
         let user = &load!(ctx.accounts.user)?;
         // if there is no order id, use the users last order id
@@ -50,20 +49,20 @@ pub fn handle_fill_perp_order<'info>(
     };
 
     let user_key = &ctx.accounts.user.key();
-    fill_order(ctx, order_id, market_index, maker_order_id).map_err(|e| {
-        msg!("Err filling order id {} for user {}", order_id, user_key);
+    fill_order(ctx, order_id, market_index).map_err(|e| {
+        msg!(
+            "Err filling order id {} for user {} for market index {}",
+            order_id,
+            user_key,
+            market_index
+        );
         e
     })?;
 
     Ok(())
 }
 
-fn fill_order(
-    ctx: Context<FillOrder>,
-    order_id: u32,
-    market_index: u16,
-    maker_order_id: Option<u32>,
-) -> Result<()> {
+fn fill_order(ctx: Context<FillOrder>, order_id: u32, market_index: u16) -> Result<()> {
     let clock = &Clock::get()?;
     let state = &ctx.accounts.state;
 
@@ -80,15 +79,7 @@ fn fill_order(
         Some(state.oracle_guard_rails),
     )?;
 
-    let (maker, maker_stats) = match maker_order_id {
-        Some(_) => {
-            let (user, user_stats) = get_maker_and_maker_stats(remaining_accounts_iter)?;
-            (Some(user), Some(user_stats))
-        }
-        None => (None, None),
-    };
-
-    let (referrer, referrer_stats) = get_referrer_and_referrer_stats(remaining_accounts_iter)?;
+    let (makers_and_referrer, makers_and_referrer_stats) = load_user_maps(remaining_accounts_iter)?;
 
     controller::repeg::update_amm(
         market_index,
@@ -108,12 +99,28 @@ fn fill_order(
         &mut oracle_map,
         &ctx.accounts.filler,
         &ctx.accounts.filler_stats,
-        maker.as_ref(),
-        maker_stats.as_ref(),
-        maker_order_id,
-        referrer.as_ref(),
-        referrer_stats.as_ref(),
+        &makers_and_referrer,
+        &makers_and_referrer_stats,
+        None,
         clock,
+    )?;
+
+    Ok(())
+}
+
+#[access_control(
+    fill_not_paused(&ctx.accounts.state)
+)]
+pub fn handle_revert_fill<'info>(ctx: Context<RevertFill>) -> Result<()> {
+    let filler = load_mut!(ctx.accounts.filler)?;
+    let clock = Clock::get()?;
+
+    validate!(
+        filler.last_active_slot == clock.slot,
+        ErrorCode::RevertFill,
+        "filler last active slot ({}) != current slot ({})",
+        filler.last_active_slot,
+        clock.slot
     )?;
 
     Ok(())
@@ -134,8 +141,8 @@ impl Default for SpotFulfillmentType {
 #[access_control(
     fill_not_paused(&ctx.accounts.state)
 )]
-pub fn handle_fill_spot_order<'info>(
-    ctx: Context<FillOrder>,
+pub fn handle_fill_spot_order<'a, 'b, 'c, 'info>(
+    ctx: Context<'a, 'b, 'c, 'info, FillOrder<'info>>,
     order_id: Option<u32>,
     fulfillment_type: Option<SpotFulfillmentType>,
     maker_order_id: Option<u32>,
@@ -168,8 +175,8 @@ pub fn handle_fill_spot_order<'info>(
     Ok(())
 }
 
-fn fill_spot_order(
-    ctx: Context<FillOrder>,
+fn fill_spot_order<'a, 'b, 'c, 'info>(
+    ctx: Context<'a, 'b, 'c, 'info, FillOrder<'info>>,
     order_id: u32,
     market_index: u16,
     fulfillment_type: Option<SpotFulfillmentType>,
@@ -198,7 +205,7 @@ fn fill_spot_order(
 
     let (_referrer, _referrer_stats) = get_referrer_and_referrer_stats(remaining_accounts_iter)?;
 
-    let mut serum_fulfillment_params = match fulfillment_type {
+    let mut fulfillment_params = match fulfillment_type {
         Some(SpotFulfillmentType::SerumV3) => {
             let base_market = spot_market_map.get_ref(&market_index)?;
             let quote_market = spot_market_map.get_quote_spot_market()?;
@@ -226,11 +233,11 @@ fn fill_spot_order(
         maker_stats.as_ref(),
         maker_order_id,
         &Clock::get()?,
-        &mut serum_fulfillment_params,
+        &mut fulfillment_params,
     )?;
 
-    match serum_fulfillment_params {
-        Some(serum_fulfillment_params) => {
+    match fulfillment_params {
+        Some(FulfillmentParams::SerumFulfillmentParams(serum_fulfillment_params)) => {
             let base_market = spot_market_map.get_ref(&market_index)?;
             validate_spot_market_vault_amount(
                 &base_market,
@@ -335,7 +342,21 @@ pub fn handle_force_cancel_orders<'info>(ctx: Context<ForceCancelOrder>) -> Resu
 }
 
 #[access_control(
-    withdraw_not_paused(&ctx.accounts.state)
+    exchange_not_paused(&ctx.accounts.state)
+)]
+pub fn handle_update_user_idle<'info>(ctx: Context<UpdateUserIdle>) -> Result<()> {
+    let mut user = load_mut!(ctx.accounts.user)?;
+    let clock = Clock::get()?;
+
+    validate_user_is_idle(&user, clock.slot)?;
+
+    user.idle = true;
+
+    Ok(())
+}
+
+#[access_control(
+    settle_pnl_not_paused(&ctx.accounts.state)
 )]
 pub fn handle_settle_pnl(ctx: Context<SettlePNL>, market_index: u16) -> Result<()> {
     let clock = Clock::get()?;
@@ -373,6 +394,8 @@ pub fn handle_settle_pnl(ctx: Context<SettlePNL>, market_index: u16) -> Result<(
             clock.slot,
             state,
         )?;
+
+        user.update_last_active_slot(clock.slot);
     } else {
         controller::repeg::update_amm(
             market_index,
@@ -380,7 +403,8 @@ pub fn handle_settle_pnl(ctx: Context<SettlePNL>, market_index: u16) -> Result<(
             &mut oracle_map,
             state,
             &clock,
-        )?;
+        )
+        .map(|_| ErrorCode::InvalidOracleForSettlePnl)?;
 
         controller::pnl::settle_pnl(
             market_index,
@@ -392,7 +416,10 @@ pub fn handle_settle_pnl(ctx: Context<SettlePNL>, market_index: u16) -> Result<(
             &mut oracle_map,
             clock.unix_timestamp,
             state,
-        )?;
+        )
+        .map(|_| ErrorCode::InvalidOracleForSettlePnl)?;
+
+        user.update_last_active_slot(clock.slot);
     }
 
     let spot_market = spot_market_map.get_quote_spot_market()?;
@@ -422,6 +449,7 @@ pub fn handle_settle_funding_payment(ctx: Context<SettleFunding>) -> Result<()> 
     )?;
 
     controller::funding::settle_funding_payments(user, &user_key, &perp_market_map, now)?;
+    user.update_last_active_slot(clock.slot);
     Ok(())
 }
 
@@ -448,12 +476,13 @@ pub fn handle_settle_lp<'info>(ctx: Context<SettleLP>, market_index: u16) -> Res
 
     let market = &mut perp_market_map.get_ref_mut(&market_index)?;
     controller::lp::settle_funding_payment_then_lp(user, &user_key, market, now)?;
+    user.update_last_active_slot(clock.slot);
 
     Ok(())
 }
 
 #[access_control(
-    withdraw_not_paused(&ctx.accounts.state)
+    settle_pnl_not_paused(&ctx.accounts.state)
 )]
 pub fn handle_settle_expired_market(ctx: Context<UpdateAMM>, market_index: u16) -> Result<()> {
     let clock = Clock::get()?;
@@ -963,7 +992,7 @@ pub fn handle_resolve_perp_bankruptcy(
 }
 
 #[access_control(
- withdraw_not_paused(&ctx.accounts.state)
+    withdraw_not_paused(&ctx.accounts.state)
 )]
 pub fn handle_resolve_spot_bankruptcy(
     ctx: Context<ResolveBankruptcy>,
@@ -1060,7 +1089,7 @@ pub fn handle_resolve_spot_bankruptcy(
 }
 
 #[access_control(
-    market_valid(&ctx.accounts.perp_market)
+    perp_market_valid(&ctx.accounts.perp_market)
     funding_not_paused(&ctx.accounts.state)
     valid_oracle_for_perp_market(&ctx.accounts.oracle, &ctx.accounts.perp_market)
 )]
@@ -1101,7 +1130,7 @@ pub fn handle_update_funding_rate(
         &mut oracle_map,
         now,
         &state.oracle_guard_rails,
-        matches!(state.exchange_status, ExchangeStatus::FundingPaused),
+        state.funding_paused()?,
         None,
     )?;
 
@@ -1183,6 +1212,7 @@ pub fn handle_settle_revenue_to_insurance_fund(
 }
 
 #[access_control(
+    spot_market_valid(&ctx.accounts.spot_market)
     exchange_not_paused(&ctx.accounts.state)
     valid_oracle_for_spot_market(&ctx.accounts.oracle, &ctx.accounts.spot_market)
 )]
@@ -1203,7 +1233,7 @@ pub fn handle_update_spot_market_cumulative_interest(
 
     let oracle_price_data = oracle_map.get_price_data(&spot_market.oracle)?;
 
-    if !matches!(state.exchange_status, ExchangeStatus::FundingPaused) {
+    if !state.funding_paused()? {
         controller::spot_balance::update_spot_market_cumulative_interest(
             spot_market,
             Some(oracle_price_data),
@@ -1289,6 +1319,22 @@ pub struct FillOrder<'info> {
 }
 
 #[derive(Accounts)]
+pub struct RevertFill<'info> {
+    pub state: Box<Account<'info, State>>,
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        constraint = can_sign_for_user(&filler, &authority)?
+    )]
+    pub filler: AccountLoader<'info, User>,
+    #[account(
+        mut,
+        constraint = is_stats_for_user(&filler, &filler_stats)?
+    )]
+    pub filler_stats: AccountLoader<'info, UserStats>,
+}
+
+#[derive(Accounts)]
 pub struct TriggerOrder<'info> {
     pub state: Box<Account<'info, State>>,
     pub authority: Signer<'info>,
@@ -1303,6 +1349,19 @@ pub struct TriggerOrder<'info> {
 
 #[derive(Accounts)]
 pub struct ForceCancelOrder<'info> {
+    pub state: Box<Account<'info, State>>,
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        constraint = can_sign_for_user(&filler, &authority)?
+    )]
+    pub filler: AccountLoader<'info, User>,
+    #[account(mut)]
+    pub user: AccountLoader<'info, User>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateUserIdle<'info> {
     pub state: Box<Account<'info, State>>,
     pub authority: Signer<'info>,
     #[account(

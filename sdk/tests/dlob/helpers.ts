@@ -19,7 +19,6 @@ import {
 	UserMapInterface,
 	Wallet,
 	OrderRecord,
-	ExchangeStatus,
 	ZERO,
 	ContractTier,
 } from '../../src';
@@ -173,6 +172,7 @@ export const mockPerpMarkets: Array<PerpMarketAccount> = [
 			quoteSettledInsurance: new BN(0),
 			quoteMaxInsurance: new BN(0),
 		},
+		quoteSpotMarketIndex: 0,
 	},
 	{
 		status: MarketStatus.INITIALIZED,
@@ -209,6 +209,7 @@ export const mockPerpMarkets: Array<PerpMarketAccount> = [
 			quoteSettledInsurance: new BN(0),
 			quoteMaxInsurance: new BN(0),
 		},
+		quoteSpotMarketIndex: 0,
 	},
 	{
 		status: MarketStatus.INITIALIZED,
@@ -245,6 +246,7 @@ export const mockPerpMarkets: Array<PerpMarketAccount> = [
 			quoteSettledInsurance: new BN(0),
 			quoteMaxInsurance: new BN(0),
 		},
+		quoteSpotMarketIndex: 0,
 	},
 ];
 
@@ -478,7 +480,7 @@ export const mockStateAccount: StateAccount = {
 	defaultMarketOrderTimeInForce: 0,
 	defaultSpotAuctionDuration: 0,
 	discountMint: PublicKey.default,
-	exchangeStatus: ExchangeStatus.ACTIVE,
+	exchangeStatus: 0,
 	liquidationMarginBufferRatio: 0,
 	lpCooldownTime: new BN(0),
 	minPerpAuctionDuration: 0,

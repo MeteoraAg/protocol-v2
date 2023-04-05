@@ -1,7 +1,8 @@
-use crate::controller::serum::SerumFulfillmentParams;
+use crate::controller::serum::{FulfillmentParams, SerumFulfillmentParams};
 use crate::error::{DriftResult, ErrorCode};
 use crate::load;
 
+use crate::math::safe_unwrap::SafeUnwrap;
 use crate::state::oracle_map::OracleMap;
 use crate::state::perp_market_map::{MarketSet, PerpMarketMap};
 use crate::state::spot_market::{
@@ -9,6 +10,7 @@ use crate::state::spot_market::{
 };
 use crate::state::spot_market_map::SpotMarketMap;
 use crate::state::state::{OracleGuardRails, State};
+use crate::state::traits::Size;
 use crate::state::user::{User, UserStats};
 use crate::validate;
 use anchor_lang::accounts::account::Account;
@@ -83,17 +85,18 @@ pub fn get_referrer_and_referrer_stats<'a>(
     Option<AccountLoader<'a, UserStats>>,
 )> {
     let referrer_account_info = account_info_iter.peek();
+
     if referrer_account_info.is_none() {
         return Ok((None, None));
     }
 
-    let referrer_account_info = referrer_account_info.unwrap();
+    let referrer_account_info = referrer_account_info.safe_unwrap()?;
     let data = referrer_account_info.try_borrow_data().map_err(|e| {
         msg!("{:?}", e);
         ErrorCode::CouldNotDeserializeReferrer
     })?;
 
-    if data.len() < std::mem::size_of::<User>() + 8 {
+    if data.len() < User::SIZE {
         return Ok((None, None));
     }
 
@@ -103,7 +106,7 @@ pub fn get_referrer_and_referrer_stats<'a>(
         return Ok((None, None));
     }
 
-    let referrer_account_info = next_account_info(account_info_iter).unwrap();
+    let referrer_account_info = next_account_info(account_info_iter).safe_unwrap()?;
 
     validate!(
         referrer_account_info.is_writable,
@@ -118,13 +121,13 @@ pub fn get_referrer_and_referrer_stats<'a>(
         return Ok((None, None));
     }
 
-    let referrer_stats_account_info = referrer_stats_account_info.unwrap();
+    let referrer_stats_account_info = referrer_stats_account_info.safe_unwrap()?;
     let data = referrer_stats_account_info.try_borrow_data().map_err(|e| {
         msg!("{:?}", e);
         ErrorCode::CouldNotDeserializeReferrerStats
     })?;
 
-    if data.len() < std::mem::size_of::<UserStats>() + 8 {
+    if data.len() < UserStats::SIZE {
         return Ok((None, None));
     }
 
@@ -134,7 +137,7 @@ pub fn get_referrer_and_referrer_stats<'a>(
         return Ok((None, None));
     }
 
-    let referrer_stats_account_info = next_account_info(account_info_iter).unwrap();
+    let referrer_stats_account_info = next_account_info(account_info_iter).safe_unwrap()?;
 
     validate!(
         referrer_stats_account_info.is_writable,
@@ -154,7 +157,7 @@ pub fn get_serum_fulfillment_accounts<'a, 'b, 'c>(
     state: &State,
     base_market: &SpotMarket,
     quote_market: &SpotMarket,
-) -> DriftResult<Option<SerumFulfillmentParams<'a, 'c>>> {
+) -> DriftResult<Option<FulfillmentParams<'a, 'c>>> {
     let account_info_vec = account_info_iter.collect::<Vec<_>>();
     let account_infos = array_ref![account_info_vec, 0, 16];
     let [serum_fulfillment_config, serum_program_id, serum_market, serum_request_queue, serum_event_queue, serum_bids, serum_asks, serum_base_vault, serum_quote_vault, serum_open_orders, serum_signer, drift_signer, token_program, base_market_vault, quote_market_vault, srm_vault] =
@@ -250,7 +253,9 @@ pub fn get_serum_fulfillment_accounts<'a, 'b, 'c>(
         signer_nonce: state.signer_nonce,
     };
 
-    Ok(Some(serum_fulfillment_accounts))
+    Ok(Some(FulfillmentParams::SerumFulfillmentParams(
+        serum_fulfillment_accounts,
+    )))
 }
 
 #[allow(clippy::type_complexity)]
@@ -299,7 +304,7 @@ pub fn get_whitelist_token<'a>(
         return Err(ErrorCode::InvalidWhitelistToken);
     }
 
-    let token_account_info = token_account_info.unwrap();
+    let token_account_info = token_account_info.safe_unwrap()?;
     let whitelist_token: Account<TokenAccount> =
         Account::try_from(token_account_info).map_err(|e| {
             msg!("Unable to deserialize whitelist token");

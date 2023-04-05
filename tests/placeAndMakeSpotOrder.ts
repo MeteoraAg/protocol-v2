@@ -6,10 +6,9 @@ import { Program } from '@project-serum/anchor';
 import { Keypair, LAMPORTS_PER_SOL } from '@solana/web3.js';
 
 import {
-	AdminClient,
+	TestClient,
 	BN,
 	PRICE_PRECISION,
-	DriftClient,
 	PositionDirection,
 	User,
 	Wallet,
@@ -28,6 +27,7 @@ import {
 	printTxLogs,
 	sleep,
 } from './testHelpers';
+import { BulkAccountLoader, PostOnlyParams } from '../sdk';
 
 describe('place and make spot order', () => {
 	const provider = anchor.AnchorProvider.local(undefined, {
@@ -38,10 +38,14 @@ describe('place and make spot order', () => {
 	anchor.setProvider(provider);
 	const chProgram = anchor.workspace.Drift as Program;
 
-	let makerDriftClient: AdminClient;
+	let makerDriftClient: TestClient;
 	let makerDriftClientUser: User;
-	const eventSubscriber = new EventSubscriber(connection, chProgram);
+	const eventSubscriber = new EventSubscriber(connection, chProgram, {
+		commitment: 'recent',
+	});
 	eventSubscriber.subscribe();
+
+	const bulkAccountLoader = new BulkAccountLoader(connection, 'confirmed', 1);
 
 	let usdcMint;
 	let userUSDCAccount;
@@ -63,7 +67,7 @@ describe('place and make spot order', () => {
 		spotMarketIndexes = [0, 1];
 		oracleInfos = [{ publicKey: solUsd, source: OracleSource.PYTH }];
 
-		makerDriftClient = new AdminClient({
+		makerDriftClient = new TestClient({
 			connection,
 			wallet: provider.wallet,
 			programID: chProgram.programId,
@@ -74,6 +78,10 @@ describe('place and make spot order', () => {
 			perpMarketIndexes: marketIndexes,
 			spotMarketIndexes: spotMarketIndexes,
 			oracleInfos,
+			accountSubscription: {
+				type: 'polling',
+				accountLoader: bulkAccountLoader,
+			},
 		});
 		await makerDriftClient.initialize(usdcMint.publicKey, true);
 		await makerDriftClient.subscribe();
@@ -113,7 +121,7 @@ describe('place and make spot order', () => {
 			provider,
 			keypair.publicKey
 		);
-		const takerDriftClient = new DriftClient({
+		const takerDriftClient = new TestClient({
 			connection,
 			wallet,
 			programID: chProgram.programId,
@@ -125,6 +133,10 @@ describe('place and make spot order', () => {
 			spotMarketIndexes: spotMarketIndexes,
 			oracleInfos,
 			userStats: true,
+			accountSubscription: {
+				type: 'polling',
+				accountLoader: bulkAccountLoader,
+			},
 		});
 		await takerDriftClient.subscribe();
 		await takerDriftClient.initializeUserAccountAndDepositCollateral(
@@ -143,9 +155,12 @@ describe('place and make spot order', () => {
 			marketIndex,
 			direction: PositionDirection.LONG,
 			baseAssetAmount,
-			price: new BN(40).mul(PRICE_PRECISION),
+			price: new BN(41).mul(PRICE_PRECISION),
+			auctionStartPrice: new BN(40).mul(PRICE_PRECISION),
+			auctionEndPrice: new BN(41).mul(PRICE_PRECISION),
+			auctionDuration: 10,
 			userOrderId: 1,
-			postOnly: false,
+			postOnly: PostOnlyParams.NONE,
 		});
 		await takerDriftClient.placeSpotOrder(takerOrderParams);
 		await takerDriftClientUser.fetchAccounts();
@@ -158,7 +173,7 @@ describe('place and make spot order', () => {
 			baseAssetAmount,
 			price: new BN(40).mul(PRICE_PRECISION),
 			userOrderId: 1,
-			postOnly: true,
+			postOnly: PostOnlyParams.MUST_POST_ONLY,
 			immediateOrCancel: true,
 		});
 

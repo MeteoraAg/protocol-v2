@@ -22,7 +22,8 @@ use crate::math::safe_math::SafeMath;
 use crate::math::stats;
 
 use crate::state::oracle::{HistoricalOracleData, OracleSource};
-use crate::state::spot_market::{SpotBalance, SpotBalanceType};
+use crate::state::spot_market::{AssetTier, SpotBalance, SpotBalanceType};
+use crate::state::traits::{MarketIndexOffset, Size};
 use crate::{AMM_TO_QUOTE_PRECISION_RATIO, PRICE_PRECISION};
 use borsh::{BorshDeserialize, BorshSerialize};
 
@@ -57,7 +58,7 @@ impl Default for ContractType {
     }
 }
 
-#[derive(Clone, Copy, BorshSerialize, BorshDeserialize, PartialEq, Debug, Eq)]
+#[derive(Clone, Copy, BorshSerialize, BorshDeserialize, PartialEq, Debug, Eq, PartialOrd, Ord)]
 pub enum ContractTier {
     A,           // max insurance capped at A level
     B,           // max insurance capped at B level
@@ -66,9 +67,26 @@ pub enum ContractTier {
     Isolated,    // no insurance, only single position allowed
 }
 
-impl Default for ContractTier {
-    fn default() -> Self {
+impl ContractTier {
+    pub fn default() -> Self {
         ContractTier::Speculative
+    }
+
+    pub fn is_as_safe_as(&self, best_contract: &ContractTier, best_asset: &AssetTier) -> bool {
+        self.is_as_safe_as_contract(best_contract) && self.is_as_safe_as_asset(best_asset)
+    }
+
+    pub fn is_as_safe_as_contract(&self, other: &ContractTier) -> bool {
+        // Contract Tier A safest
+        self <= other
+    }
+    pub fn is_as_safe_as_asset(&self, other: &AssetTier) -> bool {
+        // allow Contract Tier A,B,C to rank above Assets below Collateral status
+        if other == &AssetTier::Unlisted {
+            true
+        } else {
+            other >= &AssetTier::Cross && self <= &ContractTier::C
+        }
     }
 }
 
@@ -101,7 +119,9 @@ pub struct PerpMarket {
     pub status: MarketStatus,
     pub contract_type: ContractType,
     pub contract_tier: ContractTier,
-    pub padding: [u8; 51],
+    pub padding1: bool,
+    pub quote_spot_market_index: u16,
+    pub padding: [u8; 48],
 }
 
 impl Default for PerpMarket {
@@ -132,9 +152,19 @@ impl Default for PerpMarket {
             status: MarketStatus::default(),
             contract_type: ContractType::default(),
             contract_tier: ContractTier::default(),
-            padding: [0; 51],
+            padding1: false,
+            quote_spot_market_index: 0,
+            padding: [0; 48],
         }
     }
+}
+
+impl Size for PerpMarket {
+    const SIZE: usize = 1216;
+}
+
+impl MarketIndexOffset for PerpMarket {
+    const MARKET_INDEX_OFFSET: usize = 1160;
 }
 
 impl PerpMarket {
@@ -468,7 +498,7 @@ impl Default for AMM {
             funding_period: 0,
             order_step_size: 0,
             order_tick_size: 0,
-            min_order_size: 0,
+            min_order_size: 1,
             max_position_size: 0,
             volume_24h: 0,
             long_intensity_volume: 0,
@@ -540,13 +570,20 @@ impl AMM {
 
     pub fn get_oracle_twap(&self, price_oracle: &AccountInfo) -> DriftResult<Option<i64>> {
         match self.oracle_source {
-            OracleSource::Pyth => Ok(Some(self.get_pyth_twap(price_oracle)?)),
+            OracleSource::Pyth | OracleSource::PythStableCoin => {
+                Ok(Some(self.get_pyth_twap(price_oracle, 1)?))
+            }
+            OracleSource::Pyth1K => Ok(Some(self.get_pyth_twap(price_oracle, 1000)?)),
+            OracleSource::Pyth1M => Ok(Some(self.get_pyth_twap(price_oracle, 1000000)?)),
             OracleSource::Switchboard => Ok(None),
-            OracleSource::QuoteAsset => panic!(),
+            OracleSource::QuoteAsset => {
+                msg!("Can't get oracle twap for quote asset");
+                Err(ErrorCode::DefaultError)
+            }
         }
     }
 
-    pub fn get_pyth_twap(&self, price_oracle: &AccountInfo) -> DriftResult<i64> {
+    pub fn get_pyth_twap(&self, price_oracle: &AccountInfo, multiple: u128) -> DriftResult<i64> {
         let pyth_price_data = price_oracle
             .try_borrow_data()
             .or(Err(ErrorCode::UnableToLoadOracle))?;
@@ -556,7 +593,9 @@ impl AMM {
 
         assert!(oracle_twap > price_data.agg.price / 10);
 
-        let oracle_precision = 10_u128.pow(price_data.expo.unsigned_abs());
+        let oracle_precision = 10_u128
+            .pow(price_data.expo.unsigned_abs())
+            .safe_div(multiple)?;
 
         let mut oracle_scale_mult = 1;
         let mut oracle_scale_div = 1;
@@ -613,6 +652,7 @@ impl AMM {
             min_base_asset_reserve: 0,
             terminal_quote_asset_reserve: default_reserves,
             peg_multiplier: crate::math::constants::PEG_PRECISION,
+            max_fill_reserve_fraction: 1,
             max_spread: 1000,
             historical_oracle_data: HistoricalOracleData {
                 last_oracle_price: PRICE_PRECISION_I64,
@@ -652,7 +692,7 @@ impl AMM {
 
             base_spread: 250,
             max_spread: 975,
-
+            funding_period: 3600,
             last_oracle_valid: true,
             ..AMM::default()
         }

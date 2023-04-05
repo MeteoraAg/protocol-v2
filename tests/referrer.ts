@@ -6,11 +6,10 @@ import { Program } from '@project-serum/anchor';
 import { Keypair, PublicKey } from '@solana/web3.js';
 
 import {
-	AdminClient,
+	TestClient,
 	BN,
 	OracleSource,
 	EventSubscriber,
-	DriftClient,
 	Wallet,
 	PRICE_PRECISION,
 } from '../sdk/src';
@@ -22,13 +21,16 @@ import {
 	initializeQuoteSpotMarket,
 	createFundedKeyPair,
 	createUserWithUSDCAccount,
+	printTxLogs,
 } from './testHelpers';
 import {
 	BASE_PRECISION,
+	BulkAccountLoader,
 	getMarketOrderParams,
 	PEG_PRECISION,
 	PositionDirection,
 } from '../sdk';
+import { decodeName } from '../sdk/lib/userName';
 
 describe('referrer', () => {
 	const provider = anchor.AnchorProvider.local(undefined, {
@@ -39,16 +41,20 @@ describe('referrer', () => {
 	anchor.setProvider(provider);
 	const chProgram = anchor.workspace.Drift as Program;
 
-	let referrerDriftClient: AdminClient;
+	let referrerDriftClient: TestClient;
 
 	let refereeKeyPair: Keypair;
-	let refereeDriftClient: DriftClient;
+	let refereeDriftClient: TestClient;
 	let refereeUSDCAccount: Keypair;
 
-	let fillerDriftClient: DriftClient;
+	let fillerDriftClient: TestClient;
 
-	const eventSubscriber = new EventSubscriber(connection, chProgram);
+	const eventSubscriber = new EventSubscriber(connection, chProgram, {
+		commitment: 'recent',
+	});
 	eventSubscriber.subscribe();
+
+	const bulkAccountLoader = new BulkAccountLoader(connection, 'confirmed', 1);
 
 	let usdcMint;
 	let referrerUSDCAccount;
@@ -84,7 +90,7 @@ describe('referrer', () => {
 				source: OracleSource.PYTH,
 			},
 		];
-		referrerDriftClient = new AdminClient({
+		referrerDriftClient = new TestClient({
 			connection,
 			wallet: provider.wallet,
 			programID: chProgram.programId,
@@ -96,6 +102,10 @@ describe('referrer', () => {
 			spotMarketIndexes: spotMarketIndexes,
 			oracleInfos,
 			userStats: true,
+			accountSubscription: {
+				type: 'polling',
+				accountLoader: bulkAccountLoader,
+			},
 		});
 
 		await referrerDriftClient.initialize(usdcMint.publicKey, true);
@@ -127,7 +137,7 @@ describe('referrer', () => {
 			refereeKeyPair.publicKey
 		);
 
-		refereeDriftClient = new DriftClient({
+		refereeDriftClient = new TestClient({
 			connection,
 			wallet: new Wallet(refereeKeyPair),
 			programID: chProgram.programId,
@@ -139,6 +149,10 @@ describe('referrer', () => {
 			spotMarketIndexes: spotMarketIndexes,
 			oracleInfos,
 			userStats: true,
+			accountSubscription: {
+				type: 'polling',
+				accountLoader: bulkAccountLoader,
+			},
 		});
 		await refereeDriftClient.subscribe();
 
@@ -149,7 +163,8 @@ describe('referrer', () => {
 			usdcAmount,
 			marketIndexes,
 			spotMarketIndexes,
-			oracleInfos
+			oracleInfos,
+			bulkAccountLoader
 		);
 	});
 
@@ -158,6 +173,19 @@ describe('referrer', () => {
 		await refereeDriftClient.unsubscribe();
 		await fillerDriftClient.unsubscribe();
 		await eventSubscriber.unsubscribe();
+	});
+
+	it('initialize referrer name account', async () => {
+		await referrerDriftClient.initializeReferrerName('crisp');
+		const referrerNameAccount =
+			await referrerDriftClient.fetchReferrerNameAccount('crisp');
+		assert(decodeName(referrerNameAccount.name) === 'crisp');
+		assert(referrerNameAccount.authority.equals(referrerDriftClient.authority));
+		assert(
+			referrerNameAccount.user.equals(
+				await referrerDriftClient.getUserAccountPublicKey()
+			)
+		);
 	});
 
 	it('initialize with referrer', async () => {
@@ -216,7 +244,7 @@ describe('referrer', () => {
 		const refereeStats = refereeDriftClient.getUserStats().getAccount();
 		assert(refereeStats.fees.totalRefereeDiscount.eq(new BN(5000)));
 
-		await refereeDriftClient.placeAndTakePerpOrder(
+		const txSig2 = await refereeDriftClient.placeAndTakePerpOrder(
 			getMarketOrderParams({
 				baseAssetAmount: BASE_PRECISION,
 				direction: PositionDirection.SHORT,
@@ -225,6 +253,8 @@ describe('referrer', () => {
 			undefined,
 			refereeDriftClient.getUserStats().getReferrerInfo()
 		);
+
+		await printTxLogs(connection, txSig2);
 	});
 
 	it('withdraw', async () => {

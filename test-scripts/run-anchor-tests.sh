@@ -5,7 +5,8 @@ if [ "$1" != "--skip-build" ]
 fi
 
 test_files=(
-  serumTest.ts
+  maxLeverageOrderParams.ts
+  multipleMakerOrders.ts
   postOnlyAmmFulfillment.ts
   imbalancePerpPnl.ts
   delistMarket.ts
@@ -18,9 +19,10 @@ test_files=(
   liquidateSpot.ts
   liquidateSpotSocialLoss.ts
   referrer.ts
-  liquidatePerpPnlForDeposit.ts 
+  liquidatePerpPnlForDeposit.ts
   liquidateBorrowForPerpPnl.ts
   liquidatePerp.ts
+  liquidatePerpAndLp.ts
   order.ts
   spotDepositWithdraw.ts
   prepegMarketOrderBaseAssetAmount.ts 
@@ -33,6 +35,7 @@ test_files=(
   stopLimits.ts 
   userOrderId.ts 
   postOnly.ts
+  placeAndMakePerp.ts
   placeAndMakeSpotOrder.ts
   roundInFavorBaseAsset.ts
   marketOrderBaseAssetAmount.ts
@@ -43,8 +46,7 @@ test_files=(
   userAccount.ts
   admin.ts
   assetTier.ts
-  pauseExchange.ts 
-  adminWithdraw.ts 
+  pauseExchange.ts
   whitelist.ts
   updateK.ts 
   curve.ts 

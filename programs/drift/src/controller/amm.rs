@@ -15,14 +15,16 @@ use crate::math::amm::calculate_quote_asset_amount_swapped;
 use crate::math::amm_spread::{calculate_spread_reserves, get_spread_reserves};
 use crate::math::casting::Cast;
 use crate::math::constants::{
-    CONCENTRATION_PRECISION, K_BPS_UPDATE_SCALE, MAX_CONCENTRATION_COEFFICIENT, MAX_K_BPS_INCREASE,
-    MAX_SQRT_K, PRICE_TO_PEG_PRECISION_RATIO,
+    CONCENTRATION_PRECISION, FEE_POOL_TO_REVENUE_POOL_THRESHOLD, K_BPS_UPDATE_SCALE,
+    MAX_CONCENTRATION_COEFFICIENT, MAX_K_BPS_INCREASE, MAX_SQRT_K, PRICE_TO_PEG_PRECISION_RATIO,
 };
 use crate::math::cp_curve::get_update_k_result;
 use crate::math::repeg::get_total_fee_lower_bound;
 use crate::math::safe_math::SafeMath;
 use crate::math::spot_balance::get_token_amount;
-use crate::math::spot_withdraw::validate_spot_balances;
+use crate::math::spot_withdraw::{
+    get_max_withdraw_for_market_with_token_amount, validate_spot_balances,
+};
 use crate::math::{amm, amm_spread, bn, cp_curve, quote_asset::*};
 
 use crate::state::events::CurveRecord;
@@ -459,7 +461,12 @@ pub fn update_pool_balances(
             market.amm.fee_pool.balance_type(),
         )?;
 
-        if market.amm.total_fee_minus_distributions < 0 {
+        let terminal_state_surplus = market
+            .amm
+            .total_fee_minus_distributions
+            .safe_sub(market.amm.total_fee_withdrawn.cast()?)?;
+
+        if terminal_state_surplus < 0 {
             // market can perform withdraw from revenue pool
             if spot_market.insurance_fund.last_revenue_settle_ts
                 > market.insurance_claim.last_revenue_withdraw_ts
@@ -487,9 +494,7 @@ pub fn update_pool_balances(
                     &SpotBalanceType::Deposit,
                 )?;
 
-                let revenue_pool_transfer = market
-                    .amm
-                    .total_fee_minus_distributions
+                let revenue_pool_transfer = terminal_state_surplus
                     .unsigned_abs()
                     .min(spot_market_revenue_pool_amount)
                     .min(max_revenue_withdraw_allowed);
@@ -517,8 +522,12 @@ pub fn update_pool_balances(
                 .cast::<i128>()?
                 .safe_add(market.amm.total_liquidation_fee.cast()?)?
                 .safe_sub(market.amm.total_fee_withdrawn.cast()?)?
+                .min(
+                    amm_fee_pool_token_amount_after
+                        .saturating_sub(FEE_POOL_TO_REVENUE_POOL_THRESHOLD)
+                        .cast()?,
+                )
                 .max(0)
-                .min(amm_fee_pool_token_amount_after.cast()?)
                 .unsigned_abs();
 
             transfer_spot_balance_to_revenue_pool(
@@ -548,11 +557,8 @@ pub fn update_pool_balances(
 
         // dont settle negative pnl to spot borrows when utilization is high (> 80%)
         let max_withdraw_amount =
-            -crate::math::orders::get_max_withdraw_for_market_with_token_amount(
-                token_amount,
-                spot_market,
-            )?
-            .cast::<i128>()?;
+            -get_max_withdraw_for_market_with_token_amount(spot_market, token_amount)?
+                .cast::<i128>()?;
 
         max_withdraw_amount.max(user_unsettled_pnl)
     };

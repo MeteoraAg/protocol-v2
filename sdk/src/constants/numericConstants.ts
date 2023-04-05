@@ -17,6 +17,7 @@ export const BN_MAX = new BN(Number.MAX_SAFE_INTEGER);
 export const TEN_MILLION = TEN_THOUSAND.mul(TEN_THOUSAND);
 
 export const MAX_LEVERAGE = new BN(5);
+export const MAX_LEVERAGE_ORDER_SIZE = new BN('18446744073709551615');
 
 export const PERCENTAGE_PRECISION_EXP = new BN(6);
 export const PERCENTAGE_PRECISION = new BN(10).pow(PERCENTAGE_PRECISION_EXP);
@@ -83,6 +84,8 @@ export const MARGIN_PRECISION = TEN_THOUSAND;
 export const BID_ASK_SPREAD_PRECISION = new BN(1000000); // 10^6
 export const LIQUIDATION_PCT_PRECISION = TEN_THOUSAND;
 
+export const FIVE_MINUTE = new BN(60 * 5);
+export const ONE_HOUR = new BN(60 * 60);
 export const ONE_YEAR = new BN(31536000);
 
 export const QUOTE_SPOT_MARKET_INDEX = 0;

@@ -18,6 +18,21 @@ pub fn get_orders(order: Order) -> [Order; 32] {
     orders
 }
 
+#[macro_export]
+macro_rules! get_orders {
+    ($($order: expr),+) => {
+        {
+            let mut orders = [Order::default(); 32];
+            let mut index = 0;
+            $(
+                index += 1;
+                orders[index - 1] = $order;
+            )+
+            orders
+        }
+    };
+}
+
 pub fn get_spot_positions(spot_position: SpotPosition) -> [SpotPosition; 8] {
     let mut spot_positions = [SpotPosition::default(); 8];
     if spot_position.market_index == 0 {
@@ -56,6 +71,14 @@ pub fn create_account_info<'a>(
 pub fn get_pyth_price(price: i64, expo: i32) -> Price {
     let mut pyth_price = Price::default();
     let price = price * 10_i64.pow(expo as u32);
+    pyth_price.agg.price = price;
+    pyth_price.twap = price;
+    pyth_price.expo = expo;
+    pyth_price
+}
+
+pub fn get_hardcoded_pyth_price(price: i64, expo: i32) -> Price {
+    let mut pyth_price = Price::default();
     pyth_price.agg.price = price;
     pyth_price.twap = price;
     pyth_price.expo = expo;
