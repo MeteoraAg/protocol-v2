@@ -1,0 +1,23 @@
+[package]
+name = "drift-interface"
+version = "2.51.0"
+description = "Created with Anchor"
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "drift"
+path = "src/lib.rs"
+
+[features]
+no-entrypoint = []
+cpi = ["no-entrypoint"]
+mainnet-beta=[]
+default=["mainnet-beta"]
+
+[dependencies]
+anchor-lang = "0.28.0"
+solana-program = "1.16.0"
+anchor-spl = "0.28.0"
+uint = { version = "0.9.1", default-features = false }
+num-traits = "0.2"
